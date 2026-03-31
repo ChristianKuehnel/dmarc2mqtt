@@ -39,6 +39,18 @@ fn run() -> Result<(), String> {
 
     for summary in &summaries {
         println!("Scanned: {}", summary.source);
+        println!(
+            "  org_name: {}",
+            summary.org_name.as_deref().unwrap_or("<missing>")
+        );
+        println!("  email: {}", summary.email.as_deref().unwrap_or("<missing>"));
+        println!(
+            "  policy_published/domain: {}",
+            summary
+                .policy_published_domain
+                .as_deref()
+                .unwrap_or("<missing>")
+        );
         println!("  Root element: {}", summary.root_element);
         println!("  Element count: {}", summary.element_count);
         println!("  Attribute count: {}", summary.attribute_count);
@@ -98,6 +110,9 @@ fn print_help() {
 
 struct ScanSummary {
     source: String,
+    org_name: Option<String>,
+    email: Option<String>,
+    policy_published_domain: Option<String>,
     root_element: String,
     element_count: usize,
     attribute_count: usize,
@@ -193,24 +208,57 @@ fn scan_xml_bytes(input: &[u8], source: &str) -> Result<ScanSummary, String> {
     let mut element_count = 0usize;
     let mut attribute_count = 0usize;
     let mut root_element: Option<String> = None;
+    let mut org_name: Option<String> = None;
+    let mut email: Option<String> = None;
+    let mut policy_published_domain: Option<String> = None;
+    let mut stack: Vec<String> = Vec::new();
 
     loop {
         match reader.read_event_into(&mut buf) {
             Ok(Event::Start(e)) => {
+                let name = local_name(e.name().as_ref());
                 element_count += 1;
                 attribute_count += e.attributes().filter_map(Result::ok).count();
                 if root_element.is_none() {
-                    let name = String::from_utf8_lossy(e.name().as_ref()).to_string();
+                    root_element = Some(name.clone());
+                }
+                stack.push(name);
+            }
+            Ok(Event::Empty(e)) => {
+                let name = local_name(e.name().as_ref());
+                element_count += 1;
+                attribute_count += e.attributes().filter_map(Result::ok).count();
+                if root_element.is_none() {
                     root_element = Some(name);
                 }
             }
-            Ok(Event::Empty(e)) => {
-                element_count += 1;
-                attribute_count += e.attributes().filter_map(Result::ok).count();
-                if root_element.is_none() {
-                    let name = String::from_utf8_lossy(e.name().as_ref()).to_string();
-                    root_element = Some(name);
+            Ok(Event::Text(e)) => {
+                let text = e
+                    .xml10_content()
+                    .map_err(|err| format!("Failed to decode text in {source}: {err}"))?
+                    .trim()
+                    .to_string();
+                if text.is_empty() {
+                    buf.clear();
+                    continue;
                 }
+
+                let current = stack.last().map(String::as_str);
+                match current {
+                    Some("org_name") if org_name.is_none() => org_name = Some(text),
+                    Some("email") if email.is_none() => email = Some(text),
+                    Some("domain")
+                        if policy_published_domain.is_none()
+                            && stack.len() >= 2
+                            && stack[stack.len() - 2] == "policy_published" =>
+                    {
+                        policy_published_domain = Some(text)
+                    }
+                    _ => {}
+                }
+            }
+            Ok(Event::End(_)) => {
+                stack.pop();
             }
             Ok(Event::Eof) => break,
             Ok(_) => {}
@@ -224,8 +272,19 @@ fn scan_xml_bytes(input: &[u8], source: &str) -> Result<ScanSummary, String> {
     let root_element = root_element.unwrap_or_else(|| "<empty document>".to_owned());
     Ok(ScanSummary {
         source: source.to_owned(),
+        org_name,
+        email,
+        policy_published_domain,
         root_element,
         element_count,
         attribute_count,
     })
+}
+
+fn local_name(name: &[u8]) -> String {
+    let raw = String::from_utf8_lossy(name);
+    match raw.rsplit_once(':') {
+        Some((_, local)) => local.to_string(),
+        None => raw.to_string(),
+    }
 }
