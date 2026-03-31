@@ -4,4 +4,7 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
+flate2 = "1.0"
 quick-xml = "0.38"
+walkdir = "2.5"
+zip = { version = "2.2", default-features = true }
