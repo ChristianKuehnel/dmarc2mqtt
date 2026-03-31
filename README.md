@@ -17,3 +17,16 @@ Reads DMARC reports from ann IMAP mailbox and forwards a processed reports via M
 - Security: Build outside of home assistant to isolate alle the mail processing.
 - Security: Use Rust as memory safe language.
 - Interoperability: Export data using MQTT to allow integration in other services.
+
+## Configuration
+
+Create or edit `config.yaml`:
+
+```yaml
+mqtt:
+  server_name: "mqtt.example.local"
+  server_port: 1883
+  login: "dmarc2mqtt"
+  password: "change-me"
+  base_topic: "mail/dmarc"
+```

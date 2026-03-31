@@ -1,0 +1,6 @@
+mqtt:
+  server_name: "mqtt.example.local"
+  server_port: 1883
+  login: "dmarc2mqtt"
+  password: "change-me"
+  base_topic: "mail/dmarc"

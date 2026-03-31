@@ -1,5 +1,7 @@
 use quick_xml::events::Event;
 use quick_xml::Reader;
+use serde::Deserialize;
+use serde::Serialize;
 use std::ffi::OsStr;
 use std::env;
 use std::fs;
@@ -7,6 +9,11 @@ use std::fs::File;
 use std::io::Read;
 use std::path::Path;
 use std::process::ExitCode;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Mutex;
+use std::thread;
+use std::time::Duration;
 use walkdir::WalkDir;
 use zip::ZipArchive;
 
@@ -25,12 +32,14 @@ fn main() -> ExitCode {
 }
 
 fn run() -> Result<(), String> {
-    let input_dir = parse_directory_arg()?;
-    let summaries = scan_directory(&input_dir)?;
+    let args = parse_args()?;
+    let config = load_config(&args.config_path)?;
+    let summaries = scan_directory(&args.directory_path)?;
 
     if summaries.is_empty() {
         return Err(format!(
-            "No supported files found in {input_dir}. Expected .xml, .gz, or .zip."
+            "No supported files found in {}. Expected .xml, .gz, or .zip.",
+            args.directory_path
         ));
     }
 
@@ -52,14 +61,23 @@ fn run() -> Result<(), String> {
         println!("  result/fail: {}", summary.result_fail_count);
     }
 
+    publish_reports_to_mqtt(&config, &summaries)?;
+
+    println!("Published reports to MQTT.");
     println!("Total documents: {}", summaries.len());
 
     Ok(())
 }
 
-fn parse_directory_arg() -> Result<String, String> {
+struct CliArgs {
+    directory_path: String,
+    config_path: String,
+}
+
+fn parse_args() -> Result<CliArgs, String> {
     let mut args = env::args().skip(1);
     let mut directory_path: Option<String> = None;
+    let mut config_path = "config.yaml".to_owned();
 
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -72,13 +90,21 @@ fn parse_directory_arg() -> Result<String, String> {
                     })?;
                 directory_path = Some(value);
             }
+            "--config" | "-c" => {
+                config_path = args
+                    .next()
+                    .ok_or_else(|| {
+                        "Missing value for --config. Usage: dmarc2mqtt --directory <PATH> [--config <PATH>]"
+                            .to_owned()
+                    })?;
+            }
             "--help" | "-h" => {
                 print_help();
                 return Err(String::new());
             }
             _ => {
                 return Err(format!(
-                    "Unknown argument: {arg}\nUsage: dmarc2mqtt --directory <PATH>"
+                    "Unknown argument: {arg}\nUsage: dmarc2mqtt --directory <PATH> [--config <PATH>]"
                 ));
             }
         }
@@ -91,17 +117,61 @@ fn parse_directory_arg() -> Result<String, String> {
         return Err(format!("Not a directory: {directory_path}"));
     }
 
-    Ok(directory_path)
+    Ok(CliArgs {
+        directory_path,
+        config_path,
+    })
 }
 
 fn print_help() {
-    println!("Usage: dmarc2mqtt --directory <PATH>");
+    println!("Usage: dmarc2mqtt --directory <PATH> [--config <PATH>]");
     println!();
     println!("Options:");
     println!("  -d, --directory <PATH>   Directory to scan for .xml, .gz, and .zip files");
+    println!("  -c, --config <PATH>      YAML config file path (default: config.yaml)");
     println!("  -h, --help         Show this help message");
 }
 
+#[derive(Debug, Deserialize)]
+struct AppConfig {
+    mqtt: MqttConfig,
+}
+
+#[derive(Debug, Deserialize)]
+struct MqttConfig {
+    server_name: String,
+    server_port: u16,
+    login: String,
+    password: String,
+    base_topic: String,
+}
+
+fn load_config(path: &str) -> Result<AppConfig, String> {
+    let content = fs::read_to_string(path)
+        .map_err(|err| format!("Failed to read config file {path}: {err}"))?;
+    let config: AppConfig =
+        serde_yaml::from_str(&content).map_err(|err| format!("Invalid YAML in {path}: {err}"))?;
+
+    if config.mqtt.server_name.trim().is_empty() {
+        return Err("Config field mqtt.server_name must not be empty".to_owned());
+    }
+    if config.mqtt.login.trim().is_empty() {
+        return Err("Config field mqtt.login must not be empty".to_owned());
+    }
+    if config.mqtt.password.trim().is_empty() {
+        return Err("Config field mqtt.password must not be empty".to_owned());
+    }
+    if config.mqtt.base_topic.trim().is_empty() {
+        return Err("Config field mqtt.base_topic must not be empty".to_owned());
+    }
+    if config.mqtt.server_port == 0 {
+        return Err("Config field mqtt.server_port must be greater than 0".to_owned());
+    }
+
+    Ok(config)
+}
+
+#[derive(Debug, Serialize)]
 struct ScanSummary {
     source: String,
     org_name: Option<String>,
@@ -109,6 +179,11 @@ struct ScanSummary {
     policy_published_domain: Option<String>,
     result_pass_count: usize,
     result_fail_count: usize,
+}
+
+#[derive(Serialize)]
+struct PublishSummary {
+    file_count: usize,
 }
 
 fn scan_directory(path: &str) -> Result<Vec<ScanSummary>, String> {
@@ -272,4 +347,76 @@ fn local_name(name: &[u8]) -> String {
         Some((_, local)) => local.to_string(),
         None => raw.to_string(),
     }
+}
+
+fn publish_reports_to_mqtt(config: &AppConfig, summaries: &[ScanSummary]) -> Result<(), String> {
+    let mut mqtt_options = rumqttc::MqttOptions::new(
+        "dmarc2mqtt",
+        config.mqtt.server_name.clone(),
+        config.mqtt.server_port,
+    );
+    mqtt_options.set_credentials(config.mqtt.login.clone(), config.mqtt.password.clone());
+    mqtt_options.set_keep_alive(Duration::from_secs(10));
+
+    let (client, mut connection) = rumqttc::Client::new(mqtt_options, 20);
+    let running = Arc::new(AtomicBool::new(true));
+    let connection_error: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+    let running_bg = Arc::clone(&running);
+    let connection_error_bg = Arc::clone(&connection_error);
+
+    let network_thread = thread::spawn(move || {
+        for notification in connection.iter() {
+            if !running_bg.load(Ordering::Relaxed) {
+                break;
+            }
+            if let Err(err) = notification {
+                if let Ok(mut slot) = connection_error_bg.lock() {
+                    *slot = Some(err.to_string());
+                }
+                break;
+            }
+        }
+    });
+
+    let reports_topic = format!("{}/reports", config.mqtt.base_topic);
+    let summary_topic = format!("{}/summary", config.mqtt.base_topic);
+
+    for report in summaries {
+        let payload = serde_json::to_vec(report)
+            .map_err(|err| format!("Failed to serialize MQTT report payload: {err}"))?;
+        client
+            .publish(
+                reports_topic.clone(),
+                rumqttc::QoS::AtLeastOnce,
+                false,
+                payload,
+            )
+            .map_err(|err| format!("Failed to publish report to MQTT: {err}"))?;
+    }
+
+    let summary_payload = serde_json::to_vec(&PublishSummary {
+        file_count: summaries.len(),
+    })
+    .map_err(|err| format!("Failed to serialize MQTT summary payload: {err}"))?;
+    client
+        .publish(
+            summary_topic,
+            rumqttc::QoS::AtLeastOnce,
+            false,
+            summary_payload,
+        )
+        .map_err(|err| format!("Failed to publish summary to MQTT: {err}"))?;
+
+    thread::sleep(Duration::from_millis(300));
+    let _ = client.disconnect();
+    running.store(false, Ordering::Relaxed);
+    let _ = network_thread.join();
+
+    if let Ok(slot) = connection_error.lock() {
+        if let Some(err) = &*slot {
+            return Err(format!("MQTT connection error: {err}"));
+        }
+    }
+
+    Ok(())
 }
