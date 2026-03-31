@@ -2,6 +2,7 @@ use quick_xml::events::Event;
 use quick_xml::Reader;
 use serde::Deserialize;
 use serde::Serialize;
+use std::collections::HashMap;
 use std::ffi::OsStr;
 use std::env;
 use std::fs;
@@ -60,6 +61,8 @@ fn run() -> Result<(), String> {
         println!("  result/pass: {}", summary.result_pass_count);
         println!("  result/fail: {}", summary.result_fail_count);
     }
+
+    print_aggregated_status(&summaries);
 
     publish_reports_to_mqtt(&config, &summaries)?;
 
@@ -346,6 +349,40 @@ fn local_name(name: &[u8]) -> String {
     match raw.rsplit_once(':') {
         Some((_, local)) => local.to_string(),
         None => raw.to_string(),
+    }
+}
+
+fn print_aggregated_status(summaries: &[ScanSummary]) {
+    let mut grouped: HashMap<(String, String), (usize, usize)> = HashMap::new();
+
+    for summary in summaries {
+        let org_name = summary
+            .org_name
+            .as_deref()
+            .unwrap_or("<missing>")
+            .to_owned();
+        let domain = summary
+            .policy_published_domain
+            .as_deref()
+            .unwrap_or("<missing>")
+            .to_owned();
+
+        let entry = grouped.entry((org_name, domain)).or_insert((0, 0));
+        entry.0 += summary.result_pass_count;
+        entry.1 += summary.result_fail_count;
+    }
+
+    println!("Aggregated status:");
+    for ((org_name, domain), (pass_count, fail_count)) in grouped {
+        let total = pass_count + fail_count;
+        let status = if fail_count == 0 {
+            "pass".to_owned()
+        } else {
+            let percent_failed = (fail_count as f64 / total as f64) * 100.0;
+            format!("{percent_failed:.1}% failed")
+        };
+
+        println!("  {org_name} / {domain}: {status}");
     }
 }
 
