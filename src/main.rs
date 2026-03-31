@@ -1,9 +1,9 @@
+mod imap_client;
 mod mqtt;
 mod parser;
 
 use std::collections::BTreeMap;
 use std::env;
-use std::path::Path;
 use std::process::ExitCode;
 
 use parser::ScanSummary;
@@ -25,13 +25,27 @@ fn main() -> ExitCode {
 fn run() -> Result<(), String> {
     let args = parse_args()?;
     let config = mqtt::load_config(&args.config_path)?;
-    let summaries = parser::scan_directory(&args.directory_path)?;
+
+    let messages = imap_client::fetch_messages_with_attachments(&config)?;
+    let mut summaries = Vec::new();
+    let mut moved_to_trash = 0usize;
+
+    for message in messages {
+        let parsed = parser::scan_report_inputs(&message.attachments)?;
+        if parsed.is_empty() {
+            continue;
+        }
+
+        summaries.extend(parsed);
+        imap_client::move_message_to_trash(&config, message.uid)?;
+        moved_to_trash += 1;
+    }
 
     if summaries.is_empty() {
-        return Err(format!(
-            "No supported files found in {}. Expected .xml, .gz, or .zip.",
-            args.directory_path
-        ));
+        return Err(
+            "No supported attachments found in configured IMAP folder. Expected .xml, .gz, or .zip attachments."
+                .to_owned(),
+        );
     }
 
     for summary in &summaries {
@@ -60,38 +74,27 @@ fn run() -> Result<(), String> {
     mqtt::publish_reports_to_mqtt(&config, &aggregated_statuses, &domain_statuses)?;
 
     println!("Published reports to MQTT.");
+    println!("Moved emails to trash: {moved_to_trash}");
     println!("Total documents: {}", summaries.len());
 
     Ok(())
 }
 
 struct CliArgs {
-    directory_path: String,
     config_path: String,
 }
 
 fn parse_args() -> Result<CliArgs, String> {
     let mut args = env::args().skip(1);
-    let mut directory_path: Option<String> = None;
     let mut config_path = "config.yaml".to_owned();
 
     while let Some(arg) = args.next() {
         match arg.as_str() {
-            "--directory" | "-d" => {
-                let value = args
-                    .next()
-                    .ok_or_else(|| {
-                        "Missing value for --directory. Usage: dmarc2mqtt --directory <PATH>"
-                            .to_owned()
-                    })?;
-                directory_path = Some(value);
-            }
             "--config" | "-c" => {
                 config_path = args
                     .next()
                     .ok_or_else(|| {
-                        "Missing value for --config. Usage: dmarc2mqtt --directory <PATH> [--config <PATH>]"
-                            .to_owned()
+                        "Missing value for --config. Usage: dmarc2mqtt [--config <PATH>]".to_owned()
                     })?;
             }
             "--help" | "-h" => {
@@ -100,32 +103,21 @@ fn parse_args() -> Result<CliArgs, String> {
             }
             _ => {
                 return Err(format!(
-                    "Unknown argument: {arg}\nUsage: dmarc2mqtt --directory <PATH> [--config <PATH>]"
+                    "Unknown argument: {arg}\nUsage: dmarc2mqtt [--config <PATH>]"
                 ));
             }
         }
     }
 
-    let directory_path =
-        directory_path.ok_or_else(|| "Missing required argument: --directory <PATH>".to_owned())?;
-
-    if !Path::new(&directory_path).is_dir() {
-        return Err(format!("Not a directory: {directory_path}"));
-    }
-
-    Ok(CliArgs {
-        directory_path,
-        config_path,
-    })
+    Ok(CliArgs { config_path })
 }
 
 fn print_help() {
-    println!("Usage: dmarc2mqtt --directory <PATH> [--config <PATH>]");
+    println!("Usage: dmarc2mqtt [--config <PATH>]");
     println!();
     println!("Options:");
-    println!("  -d, --directory <PATH>   Directory to scan for .xml, .gz, and .zip files");
     println!("  -c, --config <PATH>      YAML config file path (default: config.yaml)");
-    println!("  -h, --help         Show this help message");
+    println!("  -h, --help               Show this help message");
 }
 
 #[derive(Debug, Clone)]

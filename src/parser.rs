@@ -1,12 +1,8 @@
+use crate::imap_client::ReportInput;
 use quick_xml::events::Event;
 use quick_xml::Reader;
 use serde::Serialize;
-use std::ffi::OsStr;
-use std::fs;
-use std::fs::File;
-use std::io::Read;
-use std::path::Path;
-use walkdir::WalkDir;
+use std::io::{Cursor, Read};
 use zip::ZipArchive;
 
 #[derive(Debug, Serialize)]
@@ -19,34 +15,26 @@ pub(crate) struct ScanSummary {
     pub(crate) result_fail_count: usize,
 }
 
-pub(crate) fn scan_directory(path: &str) -> Result<Vec<ScanSummary>, String> {
+pub(crate) fn scan_report_inputs(inputs: &[ReportInput]) -> Result<Vec<ScanSummary>, String> {
     let mut summaries = Vec::new();
 
-    for entry_result in WalkDir::new(path) {
-        let entry = entry_result.map_err(|err| format!("Failed to walk directory {path}: {err}"))?;
-        if !entry.file_type().is_file() {
-            continue;
-        }
-
-        let file_path = entry.path();
-        let extension = file_path
-            .extension()
-            .and_then(OsStr::to_str)
-            .map(|e| e.to_ascii_lowercase());
+    for input in inputs {
+        let extension = input
+            .file_name
+            .rsplit_once('.')
+            .map(|(_, ext)| ext.to_ascii_lowercase());
 
         match extension.as_deref() {
             Some("xml") => {
-                let input = fs::read(file_path)
-                    .map_err(|err| format!("Failed to read {}: {err}", file_path.display()))?;
-                summaries.push(scan_xml_bytes(&input, &file_path.display().to_string())?);
+                summaries.push(scan_xml_bytes(&input.bytes, &input.source)?);
             }
             Some("gz") => {
-                let input = read_gzip_file(file_path)?;
-                summaries.push(scan_xml_bytes(&input, &file_path.display().to_string())?);
+                let decompressed = decompress_gzip_bytes(&input.bytes, &input.source)?;
+                summaries.push(scan_xml_bytes(&decompressed, &input.source)?);
             }
             Some("zip") => {
-                let zip_summaries = scan_zip_file(file_path)?;
-                summaries.extend(zip_summaries);
+                let zipped = scan_zip_bytes(&input.bytes, &input.source)?;
+                summaries.extend(zipped);
             }
             _ => {}
         }
@@ -55,26 +43,25 @@ pub(crate) fn scan_directory(path: &str) -> Result<Vec<ScanSummary>, String> {
     Ok(summaries)
 }
 
-fn read_gzip_file(path: &Path) -> Result<Vec<u8>, String> {
-    let file = File::open(path).map_err(|err| format!("Failed to open {}: {err}", path.display()))?;
-    let mut decoder = flate2::read::GzDecoder::new(file);
+fn decompress_gzip_bytes(input: &[u8], source: &str) -> Result<Vec<u8>, String> {
+    let mut decoder = flate2::read::GzDecoder::new(input);
     let mut decompressed = Vec::new();
     decoder
         .read_to_end(&mut decompressed)
-        .map_err(|err| format!("Failed to decompress {}: {err}", path.display()))?;
+        .map_err(|err| format!("Failed to decompress gzip attachment {source}: {err}"))?;
     Ok(decompressed)
 }
 
-fn scan_zip_file(path: &Path) -> Result<Vec<ScanSummary>, String> {
-    let file = File::open(path).map_err(|err| format!("Failed to open {}: {err}", path.display()))?;
+fn scan_zip_bytes(input: &[u8], source: &str) -> Result<Vec<ScanSummary>, String> {
+    let cursor = Cursor::new(input);
     let mut archive =
-        ZipArchive::new(file).map_err(|err| format!("Failed to open ZIP {}: {err}", path.display()))?;
+        ZipArchive::new(cursor).map_err(|err| format!("Failed to read ZIP attachment {source}: {err}"))?;
     let mut summaries = Vec::new();
 
     for index in 0..archive.len() {
         let mut entry = archive
             .by_index(index)
-            .map_err(|err| format!("Failed to read entry {index} in {}: {err}", path.display()))?;
+            .map_err(|err| format!("Failed to read ZIP entry {index} in {source}: {err}"))?;
 
         if !entry.is_file() {
             continue;
@@ -85,16 +72,13 @@ fn scan_zip_file(path: &Path) -> Result<Vec<ScanSummary>, String> {
             continue;
         }
 
-        let mut input = Vec::new();
-        entry.read_to_end(&mut input).map_err(|err| {
-            format!(
-                "Failed to decompress entry {name} in {}: {err}",
-                path.display()
-            )
-        })?;
+        let mut xml_bytes = Vec::new();
+        entry
+            .read_to_end(&mut xml_bytes)
+            .map_err(|err| format!("Failed to read ZIP entry {name} in {source}: {err}"))?;
 
-        let source = format!("{}:{name}", path.display());
-        summaries.push(scan_xml_bytes(&input, &source)?);
+        let nested_source = format!("{source}:{name}");
+        summaries.push(scan_xml_bytes(&xml_bytes, &nested_source)?);
     }
 
     Ok(summaries)

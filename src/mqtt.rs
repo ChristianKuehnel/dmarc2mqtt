@@ -13,6 +13,7 @@ use crate::DomainStatus;
 #[derive(Debug, Deserialize)]
 pub(crate) struct AppConfig {
     pub(crate) mqtt: MqttConfig,
+    pub(crate) imap: ImapConfig,
 }
 
 #[derive(Debug, Deserialize)]
@@ -22,6 +23,16 @@ pub(crate) struct MqttConfig {
     pub(crate) login: String,
     pub(crate) password: String,
     pub(crate) base_topic: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub(crate) struct ImapConfig {
+    pub(crate) server_name: String,
+    pub(crate) server_port: u16,
+    pub(crate) login: String,
+    pub(crate) password: String,
+    pub(crate) report_folder: String,
+    pub(crate) trash_folder: String,
 }
 
 #[derive(Serialize)]
@@ -53,6 +64,24 @@ pub(crate) fn load_config(path: &str) -> Result<AppConfig, String> {
     }
     if config.mqtt.server_port == 0 {
         return Err("Config field mqtt.server_port must be greater than 0".to_owned());
+    }
+    if config.imap.server_name.trim().is_empty() {
+        return Err("Config field imap.server_name must not be empty".to_owned());
+    }
+    if config.imap.login.trim().is_empty() {
+        return Err("Config field imap.login must not be empty".to_owned());
+    }
+    if config.imap.password.trim().is_empty() {
+        return Err("Config field imap.password must not be empty".to_owned());
+    }
+    if config.imap.report_folder.trim().is_empty() {
+        return Err("Config field imap.report_folder must not be empty".to_owned());
+    }
+    if config.imap.trash_folder.trim().is_empty() {
+        return Err("Config field imap.trash_folder must not be empty".to_owned());
+    }
+    if config.imap.server_port == 0 {
+        return Err("Config field imap.server_port must be greater than 0".to_owned());
     }
 
     Ok(config)
