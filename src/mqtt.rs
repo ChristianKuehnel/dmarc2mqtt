@@ -1,6 +1,7 @@
 use serde::Deserialize;
 use serde::Serialize;
 use std::fs;
+use std::str::FromStr;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -34,6 +35,12 @@ pub(crate) struct ImapConfig {
     pub(crate) report_folder: String,
     pub(crate) trash_folder: String,
     pub(crate) move_emails: bool,
+    #[serde(default = "default_poll_cron")]
+    pub(crate) poll_cron: String,
+}
+
+fn default_poll_cron() -> String {
+    "0 0 */6 * * *".to_owned()
 }
 
 #[derive(Serialize)]
@@ -84,6 +91,15 @@ pub(crate) fn load_config(path: &str) -> Result<AppConfig, String> {
     if config.imap.server_port == 0 {
         return Err("Config field imap.server_port must be greater than 0".to_owned());
     }
+    if config.imap.poll_cron.trim().is_empty() {
+        return Err("Config field imap.poll_cron must not be empty".to_owned());
+    }
+    cron::Schedule::from_str(&config.imap.poll_cron).map_err(|err| {
+        format!(
+            "Config field imap.poll_cron is invalid ({}): {err}",
+            config.imap.poll_cron
+        )
+    })?;
 
     Ok(config)
 }

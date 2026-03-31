@@ -5,7 +5,12 @@ mod parser;
 use std::collections::BTreeMap;
 use std::env;
 use std::process::ExitCode;
+use std::str::FromStr;
+use std::thread;
+use std::time::Duration;
 
+use chrono::{DateTime, Local, Utc};
+use cron::Schedule;
 use env_logger::Env;
 use log::{error, info};
 use parser::ScanSummary;
@@ -33,8 +38,44 @@ fn init_logger() {
 fn run() -> Result<(), String> {
     let args = parse_args()?;
     let config = mqtt::load_config(&args.config_path)?;
+    let schedule = Schedule::from_str(&config.imap.poll_cron).map_err(|err| {
+        format!(
+            "Config field imap.poll_cron is invalid ({}): {err}",
+            config.imap.poll_cron
+        )
+    })?;
 
-    let messages = imap_client::fetch_messages_with_attachments(&config)?;
+    info!(
+        "Starting daemon poll loop for IMAP folder '{}' with schedule '{}'.",
+        config.imap.report_folder, config.imap.poll_cron
+    );
+
+    process_once(&config);
+
+    loop {
+        let next_run = next_tick(&schedule)?;
+        let wait = until(next_run);
+        info!(
+            "Next polling run at {} (in {}).",
+            next_run.with_timezone(&Local).format("%Y-%m-%d %H:%M:%S %Z"),
+            human_duration(wait)
+        );
+        thread::sleep(wait);
+
+        process_once(&config);
+    }
+}
+
+fn process_once(config: &mqtt::AppConfig) {
+    info!("Starting IMAP polling cycle.");
+
+    if let Err(err) = process_once_inner(config) {
+        error!("Polling cycle failed: {err}");
+    }
+}
+
+fn process_once_inner(config: &mqtt::AppConfig) -> Result<(), String> {
+    let messages = imap_client::fetch_messages_with_attachments(config)?;
     let mut summaries = Vec::new();
     let mut moved_to_trash = 0usize;
 
@@ -46,16 +87,16 @@ fn run() -> Result<(), String> {
 
         summaries.extend(parsed);
         if config.imap.move_emails {
-            imap_client::move_message_to_trash(&config, message.uid)?;
+            imap_client::move_message_to_trash(config, message.uid)?;
             moved_to_trash += 1;
         }
     }
 
     if summaries.is_empty() {
-        return Err(
+        info!(
             "No supported attachments found in configured IMAP folder. Expected .xml, .gz, or .zip attachments."
-                .to_owned(),
         );
+        return Ok(());
     }
 
     for summary in &summaries {
@@ -81,7 +122,7 @@ fn run() -> Result<(), String> {
     print_aggregated_status(&aggregated_statuses);
     print_domain_status(&domain_statuses);
 
-    mqtt::publish_reports_to_mqtt(&config, &aggregated_statuses, &domain_statuses)?;
+    mqtt::publish_reports_to_mqtt(config, &aggregated_statuses, &domain_statuses)?;
 
     info!("Published reports to MQTT.");
     if config.imap.move_emails {
@@ -92,6 +133,31 @@ fn run() -> Result<(), String> {
     info!("Total documents: {}", summaries.len());
 
     Ok(())
+}
+
+fn next_tick(schedule: &Schedule) -> Result<DateTime<Utc>, String> {
+    schedule
+        .upcoming(Utc)
+        .next()
+        .ok_or_else(|| "Polling schedule has no upcoming execution time".to_owned())
+}
+
+fn until(next_run: DateTime<Utc>) -> Duration {
+    let now = Utc::now();
+    if next_run <= now {
+        return Duration::from_secs(0);
+    }
+
+    let delta = next_run.signed_duration_since(now);
+    delta.to_std().unwrap_or_else(|_| Duration::from_secs(0))
+}
+
+fn human_duration(duration: Duration) -> String {
+    let total = duration.as_secs();
+    let hours = total / 3600;
+    let minutes = (total % 3600) / 60;
+    let seconds = total % 60;
+    format!("{hours}h {minutes}m {seconds}s")
 }
 
 struct CliArgs {
@@ -105,11 +171,9 @@ fn parse_args() -> Result<CliArgs, String> {
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--config" | "-c" => {
-                config_path = args
-                    .next()
-                    .ok_or_else(|| {
-                        "Missing value for --config. Usage: dmarc2mqtt [--config <PATH>]".to_owned()
-                    })?;
+                config_path = args.next().ok_or_else(|| {
+                    "Missing value for --config. Usage: dmarc2mqtt [--config <PATH>]".to_owned()
+                })?;
             }
             "--help" | "-h" => {
                 print_help();

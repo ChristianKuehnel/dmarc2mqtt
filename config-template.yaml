@@ -12,3 +12,4 @@ imap:
   report_folder: "INBOX/DMARC"
   trash_folder: "INBOX/Trash"
   move_emails: false
+  poll_cron: "0 0 */6 * * *"

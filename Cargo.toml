@@ -4,6 +4,8 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
+chrono = { version = "0.4", default-features = true }
+cron = "0.15"
 env_logger = "0.11"
 flate2 = "1.0"
 imap = { version = "3.0.0-alpha.15", default-features = false, features = ["rustls-tls"] }
