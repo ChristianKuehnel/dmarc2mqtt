@@ -34,9 +34,6 @@ fn run() -> Result<(), String> {
         ));
     }
 
-    let total_elements: usize = summaries.iter().map(|s| s.element_count).sum();
-    let total_attributes: usize = summaries.iter().map(|s| s.attribute_count).sum();
-
     for summary in &summaries {
         println!("Scanned: {}", summary.source);
         println!(
@@ -51,14 +48,11 @@ fn run() -> Result<(), String> {
                 .as_deref()
                 .unwrap_or("<missing>")
         );
-        println!("  Root element: {}", summary.root_element);
-        println!("  Element count: {}", summary.element_count);
-        println!("  Attribute count: {}", summary.attribute_count);
+        println!("  result/pass: {}", summary.result_pass_count);
+        println!("  result/fail: {}", summary.result_fail_count);
     }
 
     println!("Total documents: {}", summaries.len());
-    println!("Total element count: {total_elements}");
-    println!("Total attribute count: {total_attributes}");
 
     Ok(())
 }
@@ -113,9 +107,8 @@ struct ScanSummary {
     org_name: Option<String>,
     email: Option<String>,
     policy_published_domain: Option<String>,
-    root_element: String,
-    element_count: usize,
-    attribute_count: usize,
+    result_pass_count: usize,
+    result_fail_count: usize,
 }
 
 fn scan_directory(path: &str) -> Result<Vec<ScanSummary>, String> {
@@ -205,32 +198,21 @@ fn scan_xml_bytes(input: &[u8], source: &str) -> Result<ScanSummary, String> {
     reader.config_mut().trim_text(true);
 
     let mut buf = Vec::new();
-    let mut element_count = 0usize;
-    let mut attribute_count = 0usize;
-    let mut root_element: Option<String> = None;
     let mut org_name: Option<String> = None;
     let mut email: Option<String> = None;
     let mut policy_published_domain: Option<String> = None;
+    let mut result_pass_count = 0usize;
+    let mut result_fail_count = 0usize;
     let mut stack: Vec<String> = Vec::new();
 
     loop {
         match reader.read_event_into(&mut buf) {
             Ok(Event::Start(e)) => {
                 let name = local_name(e.name().as_ref());
-                element_count += 1;
-                attribute_count += e.attributes().filter_map(Result::ok).count();
-                if root_element.is_none() {
-                    root_element = Some(name.clone());
-                }
                 stack.push(name);
             }
             Ok(Event::Empty(e)) => {
-                let name = local_name(e.name().as_ref());
-                element_count += 1;
-                attribute_count += e.attributes().filter_map(Result::ok).count();
-                if root_element.is_none() {
-                    root_element = Some(name);
-                }
+                let _ = local_name(e.name().as_ref());
             }
             Ok(Event::Text(e)) => {
                 let text = e
@@ -247,6 +229,11 @@ fn scan_xml_bytes(input: &[u8], source: &str) -> Result<ScanSummary, String> {
                 match current {
                     Some("org_name") if org_name.is_none() => org_name = Some(text),
                     Some("email") if email.is_none() => email = Some(text),
+                    Some("result") => match text.to_ascii_lowercase().as_str() {
+                        "pass" => result_pass_count += 1,
+                        "fail" => result_fail_count += 1,
+                        _ => {}
+                    },
                     Some("domain")
                         if policy_published_domain.is_none()
                             && stack.len() >= 2
@@ -269,15 +256,13 @@ fn scan_xml_bytes(input: &[u8], source: &str) -> Result<ScanSummary, String> {
         buf.clear();
     }
 
-    let root_element = root_element.unwrap_or_else(|| "<empty document>".to_owned());
     Ok(ScanSummary {
         source: source.to_owned(),
         org_name,
         email,
         policy_published_domain,
-        root_element,
-        element_count,
-        attribute_count,
+        result_pass_count,
+        result_fail_count,
     })
 }
 
