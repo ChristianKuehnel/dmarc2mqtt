@@ -37,8 +37,10 @@ fn run() -> Result<(), String> {
         }
 
         summaries.extend(parsed);
-        imap_client::move_message_to_trash(&config, message.uid)?;
-        moved_to_trash += 1;
+        if config.imap.move_emails {
+            imap_client::move_message_to_trash(&config, message.uid)?;
+            moved_to_trash += 1;
+        }
     }
 
     if summaries.is_empty() {
@@ -74,7 +76,11 @@ fn run() -> Result<(), String> {
     mqtt::publish_reports_to_mqtt(&config, &aggregated_statuses, &domain_statuses)?;
 
     println!("Published reports to MQTT.");
-    println!("Moved emails to trash: {moved_to_trash}");
+    if config.imap.move_emails {
+        println!("Moved emails to trash: {moved_to_trash}");
+    } else {
+        println!("Move emails disabled (imap.move_emails=false).");
+    }
     println!("Total documents: {}", summaries.len());
 
     Ok(())

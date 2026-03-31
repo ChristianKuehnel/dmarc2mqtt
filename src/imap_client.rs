@@ -1,7 +1,5 @@
 use crate::mqtt::AppConfig;
 use mailparse::ParsedMail;
-use rustls_connector::RustlsConnector;
-use std::net::TcpStream;
 
 #[derive(Debug, Clone)]
 pub(crate) struct ReportInput {
@@ -36,7 +34,7 @@ pub(crate) fn fetch_messages_with_attachments(config: &AppConfig) -> Result<Vec<
             .uid_fetch(uid.to_string(), "RFC822")
             .map_err(|err| format!("Failed to fetch IMAP message UID {uid}: {err}"))?;
 
-        for fetch in &fetches {
+        for fetch in fetches.iter() {
             if let Some(raw) = fetch.body() {
                 let attachments = extract_attachment_inputs(raw, &folder, uid)?;
                 messages.push(MailMessage { uid, attachments });
@@ -86,24 +84,15 @@ pub(crate) fn move_message_to_trash(config: &AppConfig, uid: u32) -> Result<(), 
 
 fn connect_and_login(
     config: &AppConfig,
-) -> Result<imap::Session<rustls_connector::TlsStream<TcpStream>>, String> {
-    let stream = TcpStream::connect((config.imap.server_name.as_str(), config.imap.server_port)).map_err(
-        |err| {
+) -> Result<imap::Session<imap::Connection>, String> {
+    let client = imap::ClientBuilder::new(&config.imap.server_name, config.imap.server_port)
+        .connect()
+        .map_err(|err| {
             format!(
-                "Failed to connect to IMAP {}:{}: {err}",
+                "Failed to establish IMAP TLS connection to {}:{}: {err}",
                 config.imap.server_name, config.imap.server_port
             )
-        },
-    )?;
-
-    let tls = RustlsConnector::new_with_native_certs()
-        .map_err(|err| format!("Failed to load native TLS certificates: {err}"))?;
-
-    let tls_stream = tls
-        .connect(&config.imap.server_name, stream)
-        .map_err(|err| format!("Failed to establish IMAP TLS connection: {err}"))?;
-
-    let client = imap::Client::new(tls_stream);
+        })?;
     client
         .login(&config.imap.login, &config.imap.password)
         .map_err(|(err, _)| format!("Failed to login to IMAP: {err}"))

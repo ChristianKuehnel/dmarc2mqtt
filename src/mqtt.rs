@@ -33,6 +33,7 @@ pub(crate) struct ImapConfig {
     pub(crate) password: String,
     pub(crate) report_folder: String,
     pub(crate) trash_folder: String,
+    pub(crate) move_emails: bool,
 }
 
 #[derive(Serialize)]

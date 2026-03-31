@@ -11,3 +11,4 @@ imap:
   password: "change-me"
   report_folder: "INBOX/DMARC"
   trash_folder: "INBOX/Trash"
+  move_emails: false
