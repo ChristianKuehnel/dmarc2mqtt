@@ -8,7 +8,7 @@ use std::thread;
 use std::time::Duration;
 
 use crate::AggregatedStatus;
-use crate::parser::ScanSummary;
+use crate::DomainStatus;
 
 #[derive(Debug, Deserialize)]
 pub(crate) struct AppConfig {
@@ -22,11 +22,6 @@ pub(crate) struct MqttConfig {
     pub(crate) login: String,
     pub(crate) password: String,
     pub(crate) base_topic: String,
-}
-
-#[derive(Serialize)]
-struct PublishSummary {
-    file_count: usize,
 }
 
 #[derive(Serialize)]
@@ -65,8 +60,8 @@ pub(crate) fn load_config(path: &str) -> Result<AppConfig, String> {
 
 pub(crate) fn publish_reports_to_mqtt(
     config: &AppConfig,
-    summaries: &[ScanSummary],
     aggregated_statuses: &[AggregatedStatus],
+    domain_statuses: &[DomainStatus],
 ) -> Result<(), String> {
     let mut mqtt_options = rumqttc::MqttOptions::new(
         "dmarc2mqtt",
@@ -96,35 +91,6 @@ pub(crate) fn publish_reports_to_mqtt(
         }
     });
 
-    let reports_topic = format!("{}/reports", config.mqtt.base_topic);
-    let summary_topic = format!("{}/summary", config.mqtt.base_topic);
-
-    for report in summaries {
-        let payload = serde_json::to_vec(report)
-            .map_err(|err| format!("Failed to serialize MQTT report payload: {err}"))?;
-        client
-            .publish(
-                reports_topic.clone(),
-                rumqttc::QoS::AtLeastOnce,
-                false,
-                payload,
-            )
-            .map_err(|err| format!("Failed to publish report to MQTT: {err}"))?;
-    }
-
-    let summary_payload = serde_json::to_vec(&PublishSummary {
-        file_count: summaries.len(),
-    })
-    .map_err(|err| format!("Failed to serialize MQTT summary payload: {err}"))?;
-    client
-        .publish(
-            summary_topic,
-            rumqttc::QoS::AtLeastOnce,
-            false,
-            summary_payload,
-        )
-        .map_err(|err| format!("Failed to publish summary to MQTT: {err}"))?;
-
     for item in aggregated_statuses {
         let object_suffix = slugify(&format!("{}_{}", item.org_name, item.domain));
         let object_id = format!("dmarc2mqtt_{}", object_suffix);
@@ -143,15 +109,42 @@ pub(crate) fn publish_reports_to_mqtt(
             .publish(discovery_topic, rumqttc::QoS::AtLeastOnce, true, config_payload)
             .map_err(|err| format!("Failed to publish Home Assistant discovery: {err}"))?;
 
-        let state_payload = serde_json::to_vec(&serde_json::json!({
-            "status": item.status,
-            "pass_count": item.pass_count,
-            "fail_count": item.fail_count
-        }))
-        .map_err(|err| format!("Failed to serialize sensor state payload: {err}"))?;
         client
-            .publish(state_topic, rumqttc::QoS::AtLeastOnce, true, state_payload)
+            .publish(
+                state_topic,
+                rumqttc::QoS::AtLeastOnce,
+                true,
+                item.status.clone(),
+            )
             .map_err(|err| format!("Failed to publish sensor state: {err}"))?;
+    }
+
+    for item in domain_statuses {
+        let object_suffix = slugify(&item.domain);
+        let object_id = format!("dmarc2mqtt_domain_{}", object_suffix);
+        let discovery_topic = format!("homeassistant/sensor/{object_id}/config");
+        let state_topic = format!("{}/domains/{}/state", config.mqtt.base_topic, object_suffix);
+
+        let config_payload = serde_json::to_vec(&HomeAssistantSensorConfig {
+            name: format!("DMARC Domain {}", item.domain),
+            unique_id: object_id.clone(),
+            state_topic: state_topic.clone(),
+            icon: "mdi:shield-check-outline".to_owned(),
+            object_id,
+        })
+        .map_err(|err| format!("Failed to serialize domain discovery payload: {err}"))?;
+        client
+            .publish(discovery_topic, rumqttc::QoS::AtLeastOnce, true, config_payload)
+            .map_err(|err| format!("Failed to publish domain discovery: {err}"))?;
+
+        client
+            .publish(
+                state_topic,
+                rumqttc::QoS::AtLeastOnce,
+                true,
+                item.status.clone(),
+            )
+            .map_err(|err| format!("Failed to publish domain state: {err}"))?;
     }
 
     thread::sleep(Duration::from_millis(300));

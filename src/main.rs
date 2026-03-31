@@ -53,9 +53,11 @@ fn run() -> Result<(), String> {
     }
 
     let aggregated_statuses = aggregate_statuses(&summaries);
+    let domain_statuses = aggregate_domain_statuses(&summaries);
     print_aggregated_status(&aggregated_statuses);
+    print_domain_status(&domain_statuses);
 
-    mqtt::publish_reports_to_mqtt(&config, &summaries, &aggregated_statuses)?;
+    mqtt::publish_reports_to_mqtt(&config, &aggregated_statuses, &domain_statuses)?;
 
     println!("Published reports to MQTT.");
     println!("Total documents: {}", summaries.len());
@@ -130,8 +132,12 @@ fn print_help() {
 pub(crate) struct AggregatedStatus {
     pub(crate) org_name: String,
     pub(crate) domain: String,
-    pub(crate) pass_count: usize,
-    pub(crate) fail_count: usize,
+    pub(crate) status: String,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct DomainStatus {
+    pub(crate) domain: String,
     pub(crate) status: String,
 }
 
@@ -164,8 +170,6 @@ fn aggregate_statuses(summaries: &[ScanSummary]) -> Vec<AggregatedStatus> {
         statuses.push(AggregatedStatus {
             org_name,
             domain,
-            pass_count,
-            fail_count,
             status,
         });
     }
@@ -177,5 +181,43 @@ fn print_aggregated_status(statuses: &[AggregatedStatus]) {
     println!("Aggregated status:");
     for item in statuses {
         println!("  {} / {}: {}", item.org_name, item.domain, item.status);
+    }
+}
+
+fn aggregate_domain_statuses(summaries: &[ScanSummary]) -> Vec<DomainStatus> {
+    let mut grouped: BTreeMap<String, (usize, usize)> = BTreeMap::new();
+
+    for summary in summaries {
+        let domain = summary
+            .policy_published_domain
+            .as_deref()
+            .unwrap_or("<missing>")
+            .to_owned();
+
+        let entry = grouped.entry(domain).or_insert((0, 0));
+        entry.0 += summary.result_pass_count;
+        entry.1 += summary.result_fail_count;
+    }
+
+    let mut statuses = Vec::new();
+    for (domain, (pass_count, fail_count)) in grouped {
+        let total = pass_count + fail_count;
+        let status = if fail_count == 0 {
+            "pass".to_owned()
+        } else {
+            let percent_failed = (fail_count as f64 / total as f64) * 100.0;
+            format!("{percent_failed:.1}% failed")
+        };
+
+        statuses.push(DomainStatus { domain, status });
+    }
+
+    statuses
+}
+
+fn print_domain_status(statuses: &[DomainStatus]) {
+    println!("Domain totals:");
+    for item in statuses {
+        println!("  {}: {}", item.domain, item.status);
     }
 }
