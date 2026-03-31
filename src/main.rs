@@ -6,20 +6,28 @@ use std::collections::BTreeMap;
 use std::env;
 use std::process::ExitCode;
 
+use env_logger::Env;
+use log::{error, info};
 use parser::ScanSummary;
 
 fn main() -> ExitCode {
+    init_logger();
+
     match run() {
         Ok(()) => ExitCode::SUCCESS,
         Err(err) => {
             if err.is_empty() {
                 ExitCode::SUCCESS
             } else {
-                eprintln!("{err}");
+                error!("{err}");
                 ExitCode::FAILURE
             }
         }
     }
+}
+
+fn init_logger() {
+    env_logger::Builder::from_env(Env::default().default_filter_or("info")).init();
 }
 
 fn run() -> Result<(), String> {
@@ -51,21 +59,21 @@ fn run() -> Result<(), String> {
     }
 
     for summary in &summaries {
-        println!("Scanned: {}", summary.source);
-        println!(
+        info!("Scanned: {}", summary.source);
+        info!(
             "  org_name: {}",
             summary.org_name.as_deref().unwrap_or("<missing>")
         );
-        println!("  email: {}", summary.email.as_deref().unwrap_or("<missing>"));
-        println!(
+        info!("  email: {}", summary.email.as_deref().unwrap_or("<missing>"));
+        info!(
             "  policy_published/domain: {}",
             summary
                 .policy_published_domain
                 .as_deref()
                 .unwrap_or("<missing>")
         );
-        println!("  result/pass: {}", summary.result_pass_count);
-        println!("  result/fail: {}", summary.result_fail_count);
+        info!("  result/pass: {}", summary.result_pass_count);
+        info!("  result/fail: {}", summary.result_fail_count);
     }
 
     let aggregated_statuses = aggregate_statuses(&summaries);
@@ -75,13 +83,13 @@ fn run() -> Result<(), String> {
 
     mqtt::publish_reports_to_mqtt(&config, &aggregated_statuses, &domain_statuses)?;
 
-    println!("Published reports to MQTT.");
+    info!("Published reports to MQTT.");
     if config.imap.move_emails {
-        println!("Moved emails to trash: {moved_to_trash}");
+        info!("Moved emails to trash: {moved_to_trash}");
     } else {
-        println!("Move emails disabled (imap.move_emails=false).");
+        info!("Move emails disabled (imap.move_emails=false).");
     }
-    println!("Total documents: {}", summaries.len());
+    info!("Total documents: {}", summaries.len());
 
     Ok(())
 }
@@ -176,9 +184,9 @@ fn aggregate_statuses(summaries: &[ScanSummary]) -> Vec<AggregatedStatus> {
 }
 
 fn print_aggregated_status(statuses: &[AggregatedStatus]) {
-    println!("Aggregated status:");
+    info!("Aggregated status:");
     for item in statuses {
-        println!("  {} / {}: {}", item.org_name, item.domain, item.status);
+        info!("  {} / {}: {}", item.org_name, item.domain, item.status);
     }
 }
 
@@ -214,8 +222,8 @@ fn aggregate_domain_statuses(summaries: &[ScanSummary]) -> Vec<DomainStatus> {
 }
 
 fn print_domain_status(statuses: &[DomainStatus]) {
-    println!("Domain totals:");
+    info!("Domain totals:");
     for item in statuses {
-        println!("  {}: {}", item.domain, item.status);
+        info!("  {}: {}", item.domain, item.status);
     }
 }
