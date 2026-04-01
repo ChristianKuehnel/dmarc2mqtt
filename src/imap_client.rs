@@ -1,4 +1,4 @@
-use crate::mqtt::AppConfig;
+use crate::config::AppConfig;
 use mailparse::ParsedMail;
 
 #[derive(Debug, Clone)]

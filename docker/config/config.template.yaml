@@ -14,3 +14,4 @@ imap:
   trash_folder: "INBOX/Trash"
   move_emails: true
   poll_cron: "0 0 */6 * * *"
+  max_xml_size: 10

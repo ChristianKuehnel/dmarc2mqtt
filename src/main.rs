@@ -1,3 +1,4 @@
+mod config;
 mod history;
 mod imap_client;
 mod mqtt;
@@ -39,7 +40,7 @@ fn init_logger() {
 
 fn run() -> Result<(), String> {
     let args = parse_args()?;
-    let config = mqtt::load_config(&args.config_path)?;
+    let config = config::load_config(&args.config_path)?;
     let history_path = history::history_path_for_config(&args.config_path);
 
     info!(
@@ -51,7 +52,7 @@ fn run() -> Result<(), String> {
     process_once(&config, &history_path);
 
     loop {
-        let config_for_schedule = mqtt::load_config(&args.config_path)?;
+        let config_for_schedule = config::load_config(&args.config_path)?;
         let schedule = parse_schedule(&config_for_schedule.imap.poll_cron)?;
         let next_run = next_tick(&schedule)?;
         let wait = until(next_run);
@@ -63,7 +64,7 @@ fn run() -> Result<(), String> {
         );
         thread::sleep(wait);
 
-        let config_for_run = mqtt::load_config(&args.config_path)?;
+        let config_for_run = config::load_config(&args.config_path)?;
         process_once(&config_for_run, &history_path);
     }
 }
@@ -74,7 +75,7 @@ fn parse_schedule(cron_expression: &str) -> Result<Schedule, String> {
     })
 }
 
-fn process_once(config: &mqtt::AppConfig, history_path: &Path) {
+fn process_once(config: &config::AppConfig, history_path: &Path) {
     info!("Starting IMAP polling cycle.");
 
     if let Err(err) = process_once_inner(config, history_path) {
@@ -82,14 +83,14 @@ fn process_once(config: &mqtt::AppConfig, history_path: &Path) {
     }
 }
 
-fn process_once_inner(config: &mqtt::AppConfig, history_path: &Path) -> Result<(), String> {
+fn process_once_inner(config: &config::AppConfig, history_path: &Path) -> Result<(), String> {
     let messages = imap_client::fetch_messages_with_attachments(config)?;
     let mut summaries = Vec::new();
     let mut message_uids_to_move = Vec::new();
     let mut moved_to_trash = 0usize;
 
     for message in messages {
-        let parsed = parser::scan_report_inputs(&message.attachments)?;
+        let parsed = parser::scan_report_inputs(&message.attachments, config.imap.max_xml_size)?;
         if parsed.is_empty() {
             continue;
         }

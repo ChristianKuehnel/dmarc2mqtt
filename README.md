@@ -11,10 +11,9 @@ Reads DMARC reports from ann IMAP mailbox and forwards a processed reports via M
 2. [x] Push to mqtt
 3. [x] publish HA sensor config
 4. [x] Read zipped files
-1. [ ] validate zip security
+1. [x] validate zip security
 5. [x] read from imap and move to trash
 6. [x] add persistent storage to avoid flapping sensors, remove sensor after x days
-1. [ ] add UUIDs for sensors?
 7. [ ] add more values/sensors?
 1. [x] wrap in docker container
 1. [x] re-read config before every execution (not only at startup)
@@ -49,12 +48,14 @@ imap:
   trash_folder: "Trash"
   move_emails: true
   poll_cron: "0 0 */6 * * *"
+  max_xml_size: 10
 ```
 
 After each mailbox poll, the app updates `history.json` in the same directory as the config file.
 It stores the latest `last_seen_epoch` (Unix epoch seconds) for every `org_name + domain` tuple.
 Home Assistant discovery is announced for all tuples from `history.json` on every poll, so sensors stay available even when no new reports arrive.
 If `mqtt.remove_stale_sensors` is set, tuples not seen for more than that many days are removed from history.
+`imap.max_xml_size` defines the maximum allowed uncompressed XML payload size in MB (applies to XML, GZIP and ZIP attachments).
 
 ## Docker
 

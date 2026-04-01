@@ -15,8 +15,12 @@ pub(crate) struct ScanSummary {
     pub(crate) result_fail_count: usize,
 }
 
-pub(crate) fn scan_report_inputs(inputs: &[ReportInput]) -> Result<Vec<ScanSummary>, String> {
+pub(crate) fn scan_report_inputs(
+    inputs: &[ReportInput],
+    max_xml_size_mb: u64,
+) -> Result<Vec<ScanSummary>, String> {
     let mut summaries = Vec::new();
+    let max_xml_bytes = max_xml_size_bytes(max_xml_size_mb)?;
 
     for input in inputs {
         let extension = input
@@ -26,14 +30,21 @@ pub(crate) fn scan_report_inputs(inputs: &[ReportInput]) -> Result<Vec<ScanSumma
 
         match extension.as_deref() {
             Some("xml") => {
+                if input.bytes.len() > max_xml_bytes {
+                    return Err(format!(
+                        "XML attachment {} exceeds configured max_xml_size ({} MB).",
+                        input.source, max_xml_size_mb
+                    ));
+                }
                 summaries.push(scan_xml_bytes(&input.bytes, &input.source)?);
             }
             Some("gz") => {
-                let decompressed = decompress_gzip_bytes(&input.bytes, &input.source)?;
+                let decompressed =
+                    decompress_gzip_bytes(&input.bytes, &input.source, max_xml_size_mb, max_xml_bytes)?;
                 summaries.push(scan_xml_bytes(&decompressed, &input.source)?);
             }
             Some("zip") => {
-                let zipped = scan_zip_bytes(&input.bytes, &input.source)?;
+                let zipped = scan_zip_bytes(&input.bytes, &input.source, max_xml_size_mb, max_xml_bytes)?;
                 summaries.extend(zipped);
             }
             _ => {}
@@ -43,23 +54,68 @@ pub(crate) fn scan_report_inputs(inputs: &[ReportInput]) -> Result<Vec<ScanSumma
     Ok(summaries)
 }
 
-fn decompress_gzip_bytes(input: &[u8], source: &str) -> Result<Vec<u8>, String> {
-    let mut decoder = flate2::read::GzDecoder::new(input);
+fn max_xml_size_bytes(max_xml_size_mb: u64) -> Result<usize, String> {
+    let bytes_u64 = max_xml_size_mb
+        .checked_mul(1024 * 1024)
+        .ok_or_else(|| format!("Config field imap.max_xml_size is too large: {max_xml_size_mb}"))?;
+    usize::try_from(bytes_u64)
+        .map_err(|_| format!("Config field imap.max_xml_size is too large: {max_xml_size_mb}"))
+}
+
+fn gzip_uncompressed_size_hint(input: &[u8]) -> Option<u64> {
+    if input.len() < 4 {
+        return None;
+    }
+    let trailer = &input[input.len() - 4..];
+    Some(u32::from_le_bytes([trailer[0], trailer[1], trailer[2], trailer[3]]) as u64)
+}
+
+fn decompress_gzip_bytes(
+    input: &[u8],
+    source: &str,
+    max_xml_size_mb: u64,
+    max_xml_bytes: usize,
+) -> Result<Vec<u8>, String> {
+    if let Some(size_hint) = gzip_uncompressed_size_hint(input) {
+        if size_hint > max_xml_bytes as u64 {
+            return Err(format!(
+                "GZIP attachment {source} exceeds configured max_xml_size ({} MB).",
+                max_xml_size_mb
+            ));
+        }
+    }
+
+    let decoder = flate2::read::GzDecoder::new(input);
     let mut decompressed = Vec::new();
+    let limit = max_xml_bytes
+        .checked_add(1)
+        .ok_or_else(|| format!("Config field imap.max_xml_size is too large: {max_xml_size_mb}"))?;
     decoder
+        .take(limit as u64)
         .read_to_end(&mut decompressed)
         .map_err(|err| format!("Failed to decompress gzip attachment {source}: {err}"))?;
+    if decompressed.len() > max_xml_bytes {
+        return Err(format!(
+            "GZIP attachment {source} exceeds configured max_xml_size ({} MB).",
+            max_xml_size_mb
+        ));
+    }
     Ok(decompressed)
 }
 
-fn scan_zip_bytes(input: &[u8], source: &str) -> Result<Vec<ScanSummary>, String> {
+fn scan_zip_bytes(
+    input: &[u8],
+    source: &str,
+    max_xml_size_mb: u64,
+    max_xml_bytes: usize,
+) -> Result<Vec<ScanSummary>, String> {
     let cursor = Cursor::new(input);
     let mut archive =
         ZipArchive::new(cursor).map_err(|err| format!("Failed to read ZIP attachment {source}: {err}"))?;
     let mut summaries = Vec::new();
 
     for index in 0..archive.len() {
-        let mut entry = archive
+        let entry = archive
             .by_index(index)
             .map_err(|err| format!("Failed to read ZIP entry {index} in {source}: {err}"))?;
 
@@ -72,10 +128,24 @@ fn scan_zip_bytes(input: &[u8], source: &str) -> Result<Vec<ScanSummary>, String
             continue;
         }
 
+        if entry.size() > max_xml_bytes as u64 {
+            return Err(format!(
+                "ZIP entry {name} in {source} exceeds configured max_xml_size ({} MB).",
+                max_xml_size_mb
+            ));
+        }
+
         let mut xml_bytes = Vec::new();
         entry
+            .take((max_xml_bytes + 1) as u64)
             .read_to_end(&mut xml_bytes)
             .map_err(|err| format!("Failed to read ZIP entry {name} in {source}: {err}"))?;
+        if xml_bytes.len() > max_xml_bytes {
+            return Err(format!(
+                "ZIP entry {name} in {source} exceeds configured max_xml_size ({} MB).",
+                max_xml_size_mb
+            ));
+        }
 
         let nested_source = format!("{source}:{name}");
         summaries.push(scan_xml_bytes(&xml_bytes, &nested_source)?);
