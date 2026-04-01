@@ -57,23 +57,13 @@ pub(crate) fn move_message_to_trash(config: &AppConfig, uid: u32) -> Result<(), 
         .map_err(|err| format!("Failed to select IMAP folder {source_folder}: {err}"))?;
 
     session
-        .uid_copy(uid.to_string(), &config.imap.trash_folder)
+        .uid_mv(uid.to_string(), &config.imap.trash_folder)
         .map_err(|err| {
             format!(
-                "Failed to copy IMAP message UID {uid} to trash folder {}: {err}",
+                "Failed to move IMAP message UID {uid} to trash folder {}: {err}",
                 config.imap.trash_folder
             )
         })?;
-
-    session
-        .uid_store(uid.to_string(), "+FLAGS (\\Deleted)")
-        .map_err(|err| format!("Failed to mark IMAP message UID {uid} as deleted: {err}"))?;
-
-    if session.uid_expunge(uid.to_string()).is_err() {
-        session
-            .expunge()
-            .map_err(|err| format!("Failed to expunge IMAP message UID {uid}: {err}"))?;
-    }
 
     session
         .logout()

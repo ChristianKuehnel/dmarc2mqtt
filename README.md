@@ -15,7 +15,7 @@ Reads DMARC reports from ann IMAP mailbox and forwards a processed reports via M
 1. [ ] add UUIDs for sensors?
 7. [ ] add more values/sensors?
 1. [x] wrap in docker container
-1. [ ] re-read config before every execution (not only at startup)
+1. [x] re-read config before every execution (not only at startup)
 
 ## Design considerations
 
@@ -42,8 +42,8 @@ imap:
   server_port: 993
   login: "user@example.com"
   password: "change-me"
-  report_folder: "INBOX/DMARC"
-  trash_folder: "INBOX/Trash"
+  report_folder: "INBOX/DMARC Reports"
+  trash_folder: "Trash"
   move_emails: false
   poll_cron: "0 0 */6 * * *"
 ```

@@ -81,6 +81,7 @@ fn process_once(config: &mqtt::AppConfig) {
 fn process_once_inner(config: &mqtt::AppConfig) -> Result<(), String> {
     let messages = imap_client::fetch_messages_with_attachments(config)?;
     let mut summaries = Vec::new();
+    let mut message_uids_to_move = Vec::new();
     let mut moved_to_trash = 0usize;
 
     for message in messages {
@@ -91,8 +92,7 @@ fn process_once_inner(config: &mqtt::AppConfig) -> Result<(), String> {
 
         summaries.extend(parsed);
         if config.imap.move_emails {
-            imap_client::move_message_to_trash(config, message.uid)?;
-            moved_to_trash += 1;
+            message_uids_to_move.push(message.uid);
         }
     }
 
@@ -127,6 +127,13 @@ fn process_once_inner(config: &mqtt::AppConfig) -> Result<(), String> {
     print_domain_status(&domain_statuses);
 
     mqtt::publish_reports_to_mqtt(config, &aggregated_statuses, &domain_statuses)?;
+
+    if config.imap.move_emails {
+        for uid in message_uids_to_move {
+            imap_client::move_message_to_trash(config, uid)?;
+            moved_to_trash += 1;
+        }
+    }
 
     info!("Published reports to MQTT.");
     if config.imap.move_emails {
