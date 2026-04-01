@@ -2,6 +2,8 @@
 
 Reads DMARC reports from ann IMAP mailbox and forwards a processed reports via MQTT to be integrated in home automation systems like home assistant.
 
+    Note: This program was mostly coded by AI and wasn't reviewed thoroughly. So it mit do weird things.
+
 ## Feature Roadmap
 1. [x] read xml
 1. [x] extract a few key results
@@ -44,7 +46,7 @@ imap:
   password: "change-me"
   report_folder: "INBOX/DMARC Reports"
   trash_folder: "Trash"
-  move_emails: false
+  move_emails: true
   poll_cron: "0 0 */6 * * *"
 ```
 
