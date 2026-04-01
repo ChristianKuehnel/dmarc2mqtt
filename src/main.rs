@@ -38,12 +38,6 @@ fn init_logger() {
 fn run() -> Result<(), String> {
     let args = parse_args()?;
     let config = mqtt::load_config(&args.config_path)?;
-    let schedule = Schedule::from_str(&config.imap.poll_cron).map_err(|err| {
-        format!(
-            "Config field imap.poll_cron is invalid ({}): {err}",
-            config.imap.poll_cron
-        )
-    })?;
 
     info!(
         "Starting daemon poll loop for IMAP folder '{}' with schedule '{}'.",
@@ -53,17 +47,27 @@ fn run() -> Result<(), String> {
     process_once(&config);
 
     loop {
+        let config_for_schedule = mqtt::load_config(&args.config_path)?;
+        let schedule = parse_schedule(&config_for_schedule.imap.poll_cron)?;
         let next_run = next_tick(&schedule)?;
         let wait = until(next_run);
         info!(
-            "Next polling run at {} (in {}).",
+            "Next polling run at {} (in {}) using schedule '{}'.",
             next_run.with_timezone(&Local).format("%Y-%m-%d %H:%M:%S %Z"),
-            human_duration(wait)
+            human_duration(wait),
+            config_for_schedule.imap.poll_cron
         );
         thread::sleep(wait);
 
-        process_once(&config);
+        let config_for_run = mqtt::load_config(&args.config_path)?;
+        process_once(&config_for_run);
     }
+}
+
+fn parse_schedule(cron_expression: &str) -> Result<Schedule, String> {
+    Schedule::from_str(cron_expression).map_err(|err| {
+        format!("Config field imap.poll_cron is invalid ({cron_expression}): {err}")
+    })
 }
 
 fn process_once(config: &mqtt::AppConfig) {
