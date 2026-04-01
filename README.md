@@ -14,7 +14,7 @@ Reads DMARC reports from ann IMAP mailbox and forwards a processed reports via M
 6. [ ] add persistent storage to avoid flapping sensors, remove sensor after x days
 1. [ ] add UUIDs for sensors?
 7. [ ] add more values/sensors?
-1. [ ] wrap in docker container
+1. [x] wrap in docker container
 1. [ ] re-read config before every execution (not only at startup)
 
 ## Design considerations
@@ -22,6 +22,9 @@ Reads DMARC reports from ann IMAP mailbox and forwards a processed reports via M
 - Security: Build outside of home assistant to isolate alle the mail processing.
 - Security: Use Rust as memory safe language.
 - Interoperability: Export data using MQTT to allow integration in other services.
+- Deployment: Deploy as container
+- Automation: Read dmarc reports via IMAP, as they arrive via email
+
 
 ## Configuration
 
@@ -34,4 +37,37 @@ mqtt:
   login: "dmarc2mqtt"
   password: "change-me"
   base_topic: "mail/dmarc"
+imap:
+  server_name: "imap.example.com"
+  server_port: 993
+  login: "user@example.com"
+  password: "change-me"
+  report_folder: "INBOX/DMARC"
+  trash_folder: "INBOX/Trash"
+  move_emails: false
+  poll_cron: "0 0 */6 * * *"
 ```
+
+## Docker
+
+Build the image:
+
+```bash
+docker build -t dmarc2mqtt:latest .
+```
+
+Use a mounted config directory. A starter config is included at `docker/config/config.template.yaml`.
+
+Create your runtime config file:
+
+```bash
+cp docker/config/config.template.yaml docker/config/config.yaml
+```
+
+```bash
+docker run --rm \
+  -v "$(pwd)/docker/config:/config:ro" \
+  dmarc2mqtt:latest
+```
+
+The container entrypoint reads `/config/config.yaml`, so edit the host file at `docker/config/config.yaml` (or mount your own directory with a `config.yaml` file).

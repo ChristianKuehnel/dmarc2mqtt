@@ -1,0 +1,15 @@
+mqtt:
+  server_name: "mqtt.example.local"
+  server_port: 1883
+  login: "dmarc2mqtt"
+  password: "change-me"
+  base_topic: "mail/dmarc"
+imap:
+  server_name: "imap.example.com"
+  server_port: 993
+  login: "user@example.com"
+  password: "change-me"
+  report_folder: "INBOX/DMARC"
+  trash_folder: "INBOX/Trash"
+  move_emails: false
+  poll_cron: "0 0 */6 * * *"
