@@ -13,7 +13,7 @@ Reads DMARC reports from ann IMAP mailbox and forwards a processed reports via M
 4. [x] Read zipped files
 1. [ ] validate zip security
 5. [x] read from imap and move to trash
-6. [ ] add persistent storage to avoid flapping sensors, remove sensor after x days
+6. [x] add persistent storage to avoid flapping sensors, remove sensor after x days
 1. [ ] add UUIDs for sensors?
 7. [ ] add more values/sensors?
 1. [x] wrap in docker container
@@ -39,6 +39,7 @@ mqtt:
   login: "dmarc2mqtt"
   password: "change-me"
   base_topic: "mail/dmarc"
+  remove_stale_sensors: 30
 imap:
   server_name: "imap.example.com"
   server_port: 993
@@ -49,6 +50,11 @@ imap:
   move_emails: true
   poll_cron: "0 0 */6 * * *"
 ```
+
+After each mailbox poll, the app updates `history.json` in the same directory as the config file.
+It stores the latest `last_seen_epoch` (Unix epoch seconds) for every `org_name + domain` tuple.
+Home Assistant discovery is announced for all tuples from `history.json` on every poll, so sensors stay available even when no new reports arrive.
+If `mqtt.remove_stale_sensors` is set, tuples not seen for more than that many days are removed from history.
 
 ## Docker
 

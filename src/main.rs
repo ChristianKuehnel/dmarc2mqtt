@@ -1,9 +1,11 @@
+mod history;
 mod imap_client;
 mod mqtt;
 mod parser;
 
 use std::collections::BTreeMap;
 use std::env;
+use std::path::Path;
 use std::process::ExitCode;
 use std::str::FromStr;
 use std::thread;
@@ -38,13 +40,15 @@ fn init_logger() {
 fn run() -> Result<(), String> {
     let args = parse_args()?;
     let config = mqtt::load_config(&args.config_path)?;
+    let history_path = history::history_path_for_config(&args.config_path);
 
     info!(
         "Starting daemon poll loop for IMAP folder '{}' with schedule '{}'.",
         config.imap.report_folder, config.imap.poll_cron
     );
+    info!("History file path: {}", history_path.display());
 
-    process_once(&config);
+    process_once(&config, &history_path);
 
     loop {
         let config_for_schedule = mqtt::load_config(&args.config_path)?;
@@ -60,7 +64,7 @@ fn run() -> Result<(), String> {
         thread::sleep(wait);
 
         let config_for_run = mqtt::load_config(&args.config_path)?;
-        process_once(&config_for_run);
+        process_once(&config_for_run, &history_path);
     }
 }
 
@@ -70,15 +74,15 @@ fn parse_schedule(cron_expression: &str) -> Result<Schedule, String> {
     })
 }
 
-fn process_once(config: &mqtt::AppConfig) {
+fn process_once(config: &mqtt::AppConfig, history_path: &Path) {
     info!("Starting IMAP polling cycle.");
 
-    if let Err(err) = process_once_inner(config) {
+    if let Err(err) = process_once_inner(config, history_path) {
         error!("Polling cycle failed: {err}");
     }
 }
 
-fn process_once_inner(config: &mqtt::AppConfig) -> Result<(), String> {
+fn process_once_inner(config: &mqtt::AppConfig, history_path: &Path) -> Result<(), String> {
     let messages = imap_client::fetch_messages_with_attachments(config)?;
     let mut summaries = Vec::new();
     let mut message_uids_to_move = Vec::new();
@@ -96,11 +100,32 @@ fn process_once_inner(config: &mqtt::AppConfig) -> Result<(), String> {
         }
     }
 
+    let history_update = history::update_history(history_path, &summaries)?;
+    if let Some(max_age_days) = config.mqtt.remove_stale_sensors {
+        let prune_result = history::prune_stale_tuples(history_path, max_age_days)?;
+        info!(
+            "Pruned stale history tuples older than {} day(s): removed {}, remaining {}.",
+            max_age_days, prune_result.removed_tuples, prune_result.remaining_tuples
+        );
+    }
+    let known_tuples = history::load_known_tuples(history_path)?;
+    let newest_seen_epoch = known_tuples.iter().map(|item| item.last_seen_epoch).max();
+    info!(
+        "Updated history file {}: {} tuple(s) seen in this poll, {} total stored.",
+        history_path.display(),
+        history_update.updated_tuples,
+        history_update.total_tuples
+    );
+    info!(
+        "Publishing Home Assistant discovery for {} tuple(s) from history (newest last_seen_epoch: {}).",
+        known_tuples.len(),
+        newest_seen_epoch.unwrap_or(0)
+    );
+
     if summaries.is_empty() {
         info!(
             "No supported attachments found in configured IMAP folder. Expected .xml, .gz, or .zip attachments."
         );
-        return Ok(());
     }
 
     for summary in &summaries {
@@ -126,7 +151,7 @@ fn process_once_inner(config: &mqtt::AppConfig) -> Result<(), String> {
     print_aggregated_status(&aggregated_statuses);
     print_domain_status(&domain_statuses);
 
-    mqtt::publish_reports_to_mqtt(config, &aggregated_statuses, &domain_statuses)?;
+    mqtt::publish_reports_to_mqtt(config, &aggregated_statuses, &domain_statuses, &known_tuples)?;
 
     if config.imap.move_emails {
         for uid in message_uids_to_move {

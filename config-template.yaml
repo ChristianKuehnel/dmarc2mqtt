@@ -4,6 +4,7 @@ mqtt:
   login: "dmarc2mqtt"
   password: "change-me"
   base_topic: "mail/dmarc"
+  remove_stale_sensors: 30
 imap:
   server_name: "imap.example.com"
   server_port: 993

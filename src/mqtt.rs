@@ -1,5 +1,6 @@
 use serde::Deserialize;
 use serde::Serialize;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::str::FromStr;
 use std::sync::Arc;
@@ -10,6 +11,7 @@ use std::time::Duration;
 
 use crate::AggregatedStatus;
 use crate::DomainStatus;
+use crate::history::KnownTuple;
 
 #[derive(Debug, Deserialize)]
 pub(crate) struct AppConfig {
@@ -24,6 +26,8 @@ pub(crate) struct MqttConfig {
     pub(crate) login: String,
     pub(crate) password: String,
     pub(crate) base_topic: String,
+    #[serde(default)]
+    pub(crate) remove_stale_sensors: Option<u64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -94,6 +98,11 @@ pub(crate) fn load_config(path: &str) -> Result<AppConfig, String> {
     if config.imap.poll_cron.trim().is_empty() {
         return Err("Config field imap.poll_cron must not be empty".to_owned());
     }
+    if matches!(config.mqtt.remove_stale_sensors, Some(0)) {
+        return Err(
+            "Config field mqtt.remove_stale_sensors must be greater than 0 when set".to_owned(),
+        );
+    }
     cron::Schedule::from_str(&config.imap.poll_cron).map_err(|err| {
         format!(
             "Config field imap.poll_cron is invalid ({}): {err}",
@@ -108,6 +117,7 @@ pub(crate) fn publish_reports_to_mqtt(
     config: &AppConfig,
     aggregated_statuses: &[AggregatedStatus],
     domain_statuses: &[DomainStatus],
+    known_tuples: &[KnownTuple],
 ) -> Result<(), String> {
     let mut mqtt_options = rumqttc::MqttOptions::new(
         "dmarc2mqtt",
@@ -137,16 +147,30 @@ pub(crate) fn publish_reports_to_mqtt(
         }
     });
 
+    let mut known_sensor_keys: BTreeMap<(String, String), (String, String)> = BTreeMap::new();
+    for item in known_tuples {
+        known_sensor_keys.insert(
+            (item.org_name.clone(), item.domain.clone()),
+            (item.org_name.clone(), item.domain.clone()),
+        );
+    }
     for item in aggregated_statuses {
-        let object_suffix = slugify(&format!("{}_{}", item.org_name, item.domain));
-        let object_id = format!("dmarc2mqtt_{}", object_suffix);
+        known_sensor_keys.insert(
+            (item.org_name.clone(), item.domain.clone()),
+            (item.org_name.clone(), item.domain.clone()),
+        );
+    }
+
+    for (_, (org_name, domain)) in known_sensor_keys {
+        let object_suffix = slugify(&format!("{org_name}_{domain}"));
+        let object_id = format!("dmarc2mqtt_{object_suffix}");
         let discovery_topic = format!("homeassistant/sensor/{object_id}/config");
-        let state_topic = format!("{}/sensors/{}/state", config.mqtt.base_topic, object_suffix);
+        let state_topic = format!("{}/sensors/{object_suffix}/state", config.mqtt.base_topic);
 
         let config_payload = serde_json::to_vec(&HomeAssistantSensorConfig {
-            name: format!("DMARC {} {}", item.org_name, item.domain),
+            name: format!("DMARC {org_name} {domain}"),
             unique_id: object_id.clone(),
-            state_topic: state_topic.clone(),
+            state_topic,
             icon: "mdi:email-check-outline".to_owned(),
             object_id,
         })
@@ -154,7 +178,11 @@ pub(crate) fn publish_reports_to_mqtt(
         client
             .publish(discovery_topic, rumqttc::QoS::AtLeastOnce, true, config_payload)
             .map_err(|err| format!("Failed to publish Home Assistant discovery: {err}"))?;
+    }
 
+    for item in aggregated_statuses {
+        let object_suffix = slugify(&format!("{}_{}", item.org_name, item.domain));
+        let state_topic = format!("{}/sensors/{}/state", config.mqtt.base_topic, object_suffix);
         client
             .publish(
                 state_topic,
@@ -165,16 +193,24 @@ pub(crate) fn publish_reports_to_mqtt(
             .map_err(|err| format!("Failed to publish sensor state: {err}"))?;
     }
 
+    let mut known_domains: BTreeSet<String> = BTreeSet::new();
+    for item in known_tuples {
+        known_domains.insert(item.domain.clone());
+    }
     for item in domain_statuses {
-        let object_suffix = slugify(&item.domain);
-        let object_id = format!("dmarc2mqtt_domain_{}", object_suffix);
+        known_domains.insert(item.domain.clone());
+    }
+
+    for domain in known_domains {
+        let object_suffix = slugify(&domain);
+        let object_id = format!("dmarc2mqtt_domain_{object_suffix}");
         let discovery_topic = format!("homeassistant/sensor/{object_id}/config");
-        let state_topic = format!("{}/domains/{}/state", config.mqtt.base_topic, object_suffix);
+        let state_topic = format!("{}/domains/{object_suffix}/state", config.mqtt.base_topic);
 
         let config_payload = serde_json::to_vec(&HomeAssistantSensorConfig {
-            name: format!("DMARC Domain {}", item.domain),
+            name: format!("DMARC Domain {domain}"),
             unique_id: object_id.clone(),
-            state_topic: state_topic.clone(),
+            state_topic,
             icon: "mdi:shield-check-outline".to_owned(),
             object_id,
         })
@@ -182,7 +218,11 @@ pub(crate) fn publish_reports_to_mqtt(
         client
             .publish(discovery_topic, rumqttc::QoS::AtLeastOnce, true, config_payload)
             .map_err(|err| format!("Failed to publish domain discovery: {err}"))?;
+    }
 
+    for item in domain_statuses {
+        let object_suffix = slugify(&item.domain);
+        let state_topic = format!("{}/domains/{object_suffix}/state", config.mqtt.base_topic);
         client
             .publish(
                 state_topic,
