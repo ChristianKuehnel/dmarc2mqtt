@@ -205,6 +205,9 @@ mod tests {
                     max_xml_size: 10,
                     max_message_size: 25,
                     max_attachment_size: 10,
+                    max_zip_entries: 1000,
+                    max_zip_xml_files: 10,
+                    max_zip_uncompressed_size: None,
                 }],
             },
         }

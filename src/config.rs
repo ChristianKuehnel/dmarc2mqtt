@@ -46,6 +46,12 @@ pub(crate) struct ImapMailboxConfig {
     pub(crate) max_message_size: u64,
     #[serde(default = "default_max_attachment_size")]
     pub(crate) max_attachment_size: u64,
+    #[serde(default = "default_max_zip_entries")]
+    pub(crate) max_zip_entries: usize,
+    #[serde(default = "default_max_zip_xml_files")]
+    pub(crate) max_zip_xml_files: usize,
+    #[serde(default)]
+    pub(crate) max_zip_uncompressed_size: Option<u64>,
 }
 
 fn default_poll_cron() -> String {
@@ -61,6 +67,14 @@ fn default_max_message_size() -> u64 {
 }
 
 fn default_max_attachment_size() -> u64 {
+    10
+}
+
+fn default_max_zip_entries() -> usize {
+    1000
+}
+
+fn default_max_zip_xml_files() -> usize {
     10
 }
 
@@ -190,6 +204,24 @@ fn validate_mailboxes(mailboxes: &[ImapMailboxConfig]) -> Result<(), String> {
                 mailbox_name
             ));
         }
+        if mailbox.max_zip_entries == 0 {
+            return Err(format!(
+                "Config field imap.mailboxes['{}'].max_zip_entries must be greater than 0",
+                mailbox_name
+            ));
+        }
+        if mailbox.max_zip_xml_files == 0 {
+            return Err(format!(
+                "Config field imap.mailboxes['{}'].max_zip_xml_files must be greater than 0",
+                mailbox_name
+            ));
+        }
+        if matches!(mailbox.max_zip_uncompressed_size, Some(0)) {
+            return Err(format!(
+                "Config field imap.mailboxes['{}'].max_zip_uncompressed_size must be greater than 0 when set",
+                mailbox_name
+            ));
+        }
         cron::Schedule::from_str(&mailbox.poll_cron).map_err(|err| {
             format!(
                 "Config field imap.mailboxes['{}'].poll_cron is invalid ({}): {err}",
@@ -254,6 +286,9 @@ mod tests {
         assert!(!config.mqtt.allow_insecure);
         assert_eq!(config.imap.mailboxes[0].max_message_size, 25);
         assert_eq!(config.imap.mailboxes[0].max_attachment_size, 10);
+        assert_eq!(config.imap.mailboxes[0].max_zip_entries, 1000);
+        assert_eq!(config.imap.mailboxes[0].max_zip_xml_files, 10);
+        assert_eq!(config.imap.mailboxes[0].max_zip_uncompressed_size, None);
     }
 
     #[test]
@@ -304,5 +339,29 @@ mod tests {
             .expect_err("zero max_attachment_size should be rejected");
 
         assert!(err.contains("max_attachment_size"));
+    }
+
+    #[test]
+    fn rejects_zero_zip_limits() {
+        let path = write_config(&format!("{}      max_zip_entries: 0\n", config_yaml("")));
+        let err = load_config(path.to_str().expect("test path should be valid unicode"))
+            .expect_err("zero max_zip_entries should be rejected");
+
+        assert!(err.contains("max_zip_entries"));
+
+        let path = write_config(&format!("{}      max_zip_xml_files: 0\n", config_yaml("")));
+        let err = load_config(path.to_str().expect("test path should be valid unicode"))
+            .expect_err("zero max_zip_xml_files should be rejected");
+
+        assert!(err.contains("max_zip_xml_files"));
+
+        let path = write_config(&format!(
+            "{}      max_zip_uncompressed_size: 0\n",
+            config_yaml("")
+        ));
+        let err = load_config(path.to_str().expect("test path should be valid unicode"))
+            .expect_err("zero max_zip_uncompressed_size should be rejected");
+
+        assert!(err.contains("max_zip_uncompressed_size"));
     }
 }

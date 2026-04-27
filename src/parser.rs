@@ -15,12 +15,22 @@ pub(crate) struct ScanSummary {
     pub(crate) result_fail_count: usize,
 }
 
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ZipLimits {
+    pub(crate) max_entries: usize,
+    pub(crate) max_xml_files: usize,
+    pub(crate) max_uncompressed_size_mb: Option<u64>,
+}
+
 pub(crate) fn scan_report_inputs(
     inputs: &[ReportInput],
     max_xml_size_mb: u64,
+    zip_limits: ZipLimits,
 ) -> Result<Vec<ScanSummary>, String> {
     let mut summaries = Vec::new();
     let max_xml_bytes = max_xml_size_bytes(max_xml_size_mb)?;
+    let max_zip_uncompressed_bytes =
+        max_zip_uncompressed_bytes(zip_limits.max_uncompressed_size_mb, max_xml_size_mb)?;
 
     for input in inputs {
         let extension = input
@@ -52,8 +62,14 @@ pub(crate) fn scan_report_inputs(
                 summaries.push(summary);
             }
             Some("zip") => {
-                let zipped =
-                    scan_zip_bytes(&input.bytes, &input.source, max_xml_size_mb, max_xml_bytes)?;
+                let zipped = scan_zip_bytes(
+                    &input.bytes,
+                    &input.source,
+                    max_xml_size_mb,
+                    max_xml_bytes,
+                    zip_limits,
+                    max_zip_uncompressed_bytes,
+                )?;
                 for summary in &zipped {
                     validate_report_sender(summary, &input.message_sender)?;
                 }
@@ -64,6 +80,18 @@ pub(crate) fn scan_report_inputs(
     }
 
     Ok(summaries)
+}
+
+fn max_zip_uncompressed_bytes(
+    max_zip_uncompressed_size_mb: Option<u64>,
+    max_xml_size_mb: u64,
+) -> Result<usize, String> {
+    let size_mb = max_zip_uncompressed_size_mb.unwrap_or(max_xml_size_mb);
+    let bytes_u64 = size_mb
+        .checked_mul(1024 * 1024)
+        .ok_or_else(|| format!("Configured max_zip_uncompressed_size is too large: {size_mb}"))?;
+    usize::try_from(bytes_u64)
+        .map_err(|_| format!("Configured max_zip_uncompressed_size is too large: {size_mb}"))
 }
 
 fn validate_report_sender(summary: &ScanSummary, message_sender: &str) -> Result<(), String> {
@@ -141,11 +169,23 @@ fn scan_zip_bytes(
     source: &str,
     max_xml_size_mb: u64,
     max_xml_bytes: usize,
+    zip_limits: ZipLimits,
+    max_zip_uncompressed_bytes: usize,
 ) -> Result<Vec<ScanSummary>, String> {
     let cursor = Cursor::new(input);
     let mut archive = ZipArchive::new(cursor)
         .map_err(|err| format!("Failed to read ZIP attachment {source}: {err}"))?;
+    if archive.len() > zip_limits.max_entries {
+        return Err(format!(
+            "ZIP attachment {source} contains {} entries, exceeding max_zip_entries ({}).",
+            archive.len(),
+            zip_limits.max_entries
+        ));
+    }
+
     let mut summaries = Vec::new();
+    let mut xml_file_count = 0usize;
+    let mut total_uncompressed_xml_bytes = 0usize;
 
     for index in 0..archive.len() {
         let entry = archive
@@ -160,11 +200,28 @@ fn scan_zip_bytes(
         if !name.to_ascii_lowercase().ends_with(".xml") {
             continue;
         }
+        xml_file_count += 1;
+        if xml_file_count > zip_limits.max_xml_files {
+            return Err(format!(
+                "ZIP attachment {source} contains more than {} XML file(s).",
+                zip_limits.max_xml_files
+            ));
+        }
 
         if entry.size() > max_xml_bytes as u64 {
             return Err(format!(
                 "ZIP entry {name} in {source} exceeds configured max_xml_size ({} MB).",
                 max_xml_size_mb
+            ));
+        }
+        total_uncompressed_xml_bytes = total_uncompressed_xml_bytes
+            .checked_add(entry.size() as usize)
+            .ok_or_else(|| {
+                format!("ZIP attachment {source} aggregate uncompressed XML size is too large.")
+            })?;
+        if total_uncompressed_xml_bytes > max_zip_uncompressed_bytes {
+            return Err(format!(
+                "ZIP attachment {source} aggregate uncompressed XML size exceeds max_zip_uncompressed_size."
             ));
         }
 
@@ -271,6 +328,7 @@ fn local_name(name: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Write;
 
     struct ExpectedSummary {
         file_name: &'static str,
@@ -278,6 +336,14 @@ mod tests {
         email: &'static str,
         pass_count: usize,
         fail_count: usize,
+    }
+
+    fn default_zip_limits() -> ZipLimits {
+        ZipLimits {
+            max_entries: 1000,
+            max_xml_files: 10,
+            max_uncompressed_size_mb: None,
+        }
     }
 
     #[test]
@@ -333,7 +399,8 @@ mod tests {
                 bytes: bytes.to_vec(),
             };
 
-            let summaries = scan_report_inputs(&[input], 1).expect("fixture should parse");
+            let summaries = scan_report_inputs(&[input], 1, default_zip_limits())
+                .expect("fixture should parse");
 
             assert_eq!(summaries.len(), 1);
             let summary = &summaries[0];
@@ -357,9 +424,114 @@ mod tests {
             bytes: include_bytes!("../tests/fixtures/dmarc-gmx.xml").to_vec(),
         };
 
-        let err = scan_report_inputs(&[input], 1).expect_err("sender mismatch should fail");
+        let err = scan_report_inputs(&[input], 1, default_zip_limits())
+            .expect_err("sender mismatch should fail");
 
         assert!(err.contains("claims report_metadata/email"));
         assert!(err.contains("attacker@example.com"));
+    }
+
+    #[test]
+    fn rejects_zip_with_too_many_entries() {
+        let input = zip_input(&[("one.txt", b"ignored".as_slice()), ("two.txt", b"ignored")]);
+
+        let err = scan_report_inputs(
+            &[input],
+            1,
+            ZipLimits {
+                max_entries: 1,
+                ..default_zip_limits()
+            },
+        )
+        .expect_err("zip entry limit should fail");
+
+        assert!(err.contains("max_zip_entries"));
+    }
+
+    #[test]
+    fn rejects_zip_with_too_many_xml_files() {
+        let input = zip_input(&[
+            ("one.xml", dmarc_xml("noreply@example.com").as_bytes()),
+            ("two.xml", dmarc_xml("noreply@example.com").as_bytes()),
+        ]);
+
+        let err = scan_report_inputs(
+            &[input],
+            1,
+            ZipLimits {
+                max_xml_files: 1,
+                ..default_zip_limits()
+            },
+        )
+        .expect_err("zip xml file limit should fail");
+
+        assert!(err.contains("more than 1 XML file"));
+    }
+
+    #[test]
+    fn rejects_zip_exceeding_aggregate_uncompressed_limit() {
+        let input = zip_input(&[
+            ("one.xml", dmarc_xml("noreply@example.com").as_bytes()),
+            ("two.xml", dmarc_xml("noreply@example.com").as_bytes()),
+        ]);
+
+        let err = scan_zip_bytes(
+            &input.bytes,
+            &input.source,
+            1,
+            1024 * 1024,
+            default_zip_limits(),
+            32,
+        )
+        .expect_err("zip aggregate size limit should fail");
+
+        assert!(err.contains("aggregate uncompressed XML size"));
+    }
+
+    fn zip_input(entries: &[(&str, &[u8])]) -> ReportInput {
+        let mut cursor = std::io::Cursor::new(Vec::new());
+        {
+            let mut writer = zip::ZipWriter::new(&mut cursor);
+            let options = zip::write::SimpleFileOptions::default();
+            for (name, bytes) in entries {
+                writer
+                    .start_file(*name, options)
+                    .expect("zip entry should start");
+                writer
+                    .write_all(bytes)
+                    .expect("zip entry should be written");
+            }
+            writer.finish().expect("zip should finish");
+        }
+
+        ReportInput {
+            source: "fixture:reports.zip".to_owned(),
+            file_name: "reports.zip".to_owned(),
+            message_sender: "noreply@example.com".to_owned(),
+            bytes: cursor.into_inner(),
+        }
+    }
+
+    fn dmarc_xml(email: &str) -> String {
+        format!(
+            r#"<?xml version="1.0" encoding="UTF-8"?>
+<feedback>
+  <report_metadata>
+    <org_name>Example</org_name>
+    <email>{email}</email>
+  </report_metadata>
+  <policy_published>
+    <domain>example.com</domain>
+  </policy_published>
+  <record>
+    <row>
+      <policy_evaluated>
+        <dkim>pass</dkim>
+        <spf>pass</spf>
+      </policy_evaluated>
+    </row>
+  </record>
+</feedback>"#
+        )
     }
 }

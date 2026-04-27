@@ -17,7 +17,7 @@ use cron::Schedule;
 use config::{AppConfig, ImapMailboxConfig};
 use env_logger::Env;
 use log::{error, info};
-use parser::ScanSummary;
+use parser::{ScanSummary, ZipLimits};
 
 fn main() -> ExitCode {
     init_logger();
@@ -127,7 +127,15 @@ fn process_mailboxes_inner(
 
         let messages = imap_client::fetch_messages_with_attachments(mailbox)?;
         for message in messages {
-            let parsed = parser::scan_report_inputs(&message.attachments, mailbox.max_xml_size)?;
+            let parsed = parser::scan_report_inputs(
+                &message.attachments,
+                mailbox.max_xml_size,
+                ZipLimits {
+                    max_entries: mailbox.max_zip_entries,
+                    max_xml_files: mailbox.max_zip_xml_files,
+                    max_uncompressed_size_mb: mailbox.max_zip_uncompressed_size,
+                },
+            )?;
             if parsed.is_empty() {
                 continue;
             }
