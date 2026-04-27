@@ -39,6 +39,8 @@ imap:
       move_emails: true
       poll_cron: "0 0 */6 * * *"
       max_xml_size: 10
+      max_message_size: 25
+      max_attachment_size: 10
     - name: "secondary"
       server_name: "imap.other.example"
       server_port: 993
@@ -49,6 +51,8 @@ imap:
       move_emails: false
       poll_cron: "0 30 */12 * * *"
       max_xml_size: 20
+      max_message_size: 25
+      max_attachment_size: 20
 ```
 
 After each mailbox poll, the app updates `history.json` in the same directory as the config file.
@@ -57,6 +61,7 @@ Home Assistant discovery is announced for all tuples from `history.json` on ever
 If `mqtt.remove_stale_sensors` is set, tuples not seen for more than that many days are removed from history.
 Each mailbox has its own connection settings, folders, schedule and `max_xml_size`.
 `imap.mailboxes[].max_xml_size` defines the maximum allowed uncompressed XML payload size in MB (applies to XML, GZIP and ZIP attachments).
+`imap.mailboxes[].max_message_size` caps IMAP messages before fetching their full RFC822 body, and `max_attachment_size` caps encoded and decoded attachment payloads before parsing.
 IMAP connections always use TLS; configure an IMAPS endpoint, typically port `993`.
 MQTT uses TLS by default (`mqtt.tls: true`) and the examples use port `8883`.
 If you must connect to a plaintext broker, set `mqtt.tls: false` and explicitly opt in with `mqtt.allow_insecure: true`.

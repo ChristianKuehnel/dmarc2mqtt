@@ -2,7 +2,7 @@ use crate::config::ImapMailboxConfig;
 use log::warn;
 use mail_auth::common::verify::VerifySignature;
 use mail_auth::{AuthenticatedMessage, DkimResult, MessageAuthenticator};
-use mailparse::{MailAddr, MailHeaderMap, ParsedMail};
+use mailparse::{body::Body, MailAddr, MailHeaderMap, ParsedMail};
 
 #[derive(Debug, Clone)]
 pub(crate) struct ReportInput {
@@ -23,6 +23,7 @@ pub(crate) fn fetch_messages_with_attachments(
 ) -> Result<Vec<MailMessage>, String> {
     let mut session = connect_and_login(mailbox)?;
     let folder = folder_path(mailbox);
+    let max_message_bytes = size_limit_bytes(mailbox.max_message_size, "max_message_size")?;
     session.select(&folder).map_err(|err| {
         format!(
             "Failed to select IMAP folder {} for mailbox '{}': {err}",
@@ -42,6 +43,10 @@ pub(crate) fn fetch_messages_with_attachments(
 
     let mut messages = Vec::new();
     for uid in sorted_ids {
+        if message_exceeds_size_limit(&mut session, mailbox, uid, max_message_bytes)? {
+            continue;
+        }
+
         let fetches = session
             .uid_fetch(uid.to_string(), "RFC822")
             .map_err(|err| {
@@ -53,6 +58,15 @@ pub(crate) fn fetch_messages_with_attachments(
 
         for fetch in fetches.iter() {
             if let Some(raw) = fetch.body() {
+                if raw.len() > max_message_bytes {
+                    warn!(
+                        "Skipping IMAP message UID {uid} for mailbox '{}': fetched message size {} byte(s) exceeds max_message_size ({} MB).",
+                        mailbox.name,
+                        raw.len(),
+                        mailbox.max_message_size
+                    );
+                    continue;
+                }
                 let attachments = extract_attachment_inputs(raw, mailbox, &folder, uid)?;
                 if !attachments.is_empty() {
                     messages.push(MailMessage { uid, attachments });
@@ -120,12 +134,46 @@ fn folder_path(mailbox: &ImapMailboxConfig) -> String {
     mailbox.report_folder.clone()
 }
 
+fn message_exceeds_size_limit(
+    session: &mut imap::Session<imap::Connection>,
+    mailbox: &ImapMailboxConfig,
+    uid: u32,
+    max_message_bytes: usize,
+) -> Result<bool, String> {
+    let fetches = session
+        .uid_fetch(uid.to_string(), "RFC822.SIZE")
+        .map_err(|err| {
+            format!(
+                "Failed to fetch IMAP message size for UID {uid} in mailbox '{}': {err}",
+                mailbox.name
+            )
+        })?;
+
+    for fetch in fetches.iter() {
+        if let Some(size) = fetch.size {
+            if size as u64 > max_message_bytes as u64 {
+                warn!(
+                    "Skipping IMAP message UID {uid} for mailbox '{}': message size {} byte(s) exceeds max_message_size ({} MB).",
+                    mailbox.name,
+                    size,
+                    mailbox.max_message_size
+                );
+                return Ok(true);
+            }
+        }
+    }
+
+    Ok(false)
+}
+
 fn extract_attachment_inputs(
     raw_message: &[u8],
     mailbox: &ImapMailboxConfig,
     folder: &str,
     message_uid: u32,
 ) -> Result<Vec<ReportInput>, String> {
+    let max_attachment_bytes =
+        size_limit_bytes(mailbox.max_attachment_size, "max_attachment_size")?;
     let parsed = mailparse::parse_mail(raw_message).map_err(|err| {
         format!(
             "Failed to parse MIME message UID {message_uid} for mailbox '{}': {err}",
@@ -141,6 +189,7 @@ fn extract_attachment_inputs(
         folder,
         message_uid,
         &message_sender,
+        max_attachment_bytes,
         &mut out,
     )?;
     if !out.is_empty() {
@@ -161,11 +210,20 @@ fn collect_attachments(
     folder: &str,
     message_uid: u32,
     message_sender: &str,
+    max_attachment_bytes: usize,
     out: &mut Vec<ReportInput>,
 ) -> Result<(), String> {
     if !part.subparts.is_empty() {
         for child in &part.subparts {
-            collect_attachments(child, mailbox, folder, message_uid, message_sender, out)?;
+            collect_attachments(
+                child,
+                mailbox,
+                folder,
+                message_uid,
+                message_sender,
+                max_attachment_bytes,
+                out,
+            )?;
         }
         return Ok(());
     }
@@ -187,12 +245,32 @@ fn collect_attachments(
     }
 
     let file_name = file_name.unwrap_or_else(|| "attachment.bin".to_owned());
+    let encoded_size = encoded_body_len(part);
+    if encoded_size > max_attachment_bytes {
+        warn!(
+            "Skipping attachment {file_name} in IMAP message UID {message_uid} for mailbox '{}': encoded attachment size {} byte(s) exceeds max_attachment_size ({} MB).",
+            mailbox.name,
+            encoded_size,
+            mailbox.max_attachment_size
+        );
+        return Ok(());
+    }
+
     let bytes = part.get_body_raw().map_err(|err| {
         format!(
             "Failed to decode attachment in message UID {message_uid} for mailbox '{}': {err}",
             mailbox.name
         )
     })?;
+    if bytes.len() > max_attachment_bytes {
+        warn!(
+            "Skipping attachment {file_name} in IMAP message UID {message_uid} for mailbox '{}': decoded attachment size {} byte(s) exceeds max_attachment_size ({} MB).",
+            mailbox.name,
+            bytes.len(),
+            mailbox.max_attachment_size
+        );
+        return Ok(());
+    }
 
     out.push(ReportInput {
         source: format!(
@@ -205,6 +283,22 @@ fn collect_attachments(
     });
 
     Ok(())
+}
+
+fn encoded_body_len(part: &ParsedMail) -> usize {
+    match part.get_body_encoded() {
+        Body::Base64(body) | Body::QuotedPrintable(body) => body.get_raw().len(),
+        Body::SevenBit(body) | Body::EightBit(body) => body.get_raw().len(),
+        Body::Binary(body) => body.get_raw().len(),
+    }
+}
+
+fn size_limit_bytes(size_mb: u64, field_name: &str) -> Result<usize, String> {
+    let bytes_u64 = size_mb
+        .checked_mul(1024 * 1024)
+        .ok_or_else(|| format!("Configured {field_name} is too large: {size_mb}"))?;
+    usize::try_from(bytes_u64)
+        .map_err(|_| format!("Configured {field_name} is too large: {size_mb}"))
 }
 
 fn message_sender(
@@ -324,6 +418,8 @@ mod tests {
             move_emails: false,
             poll_cron: "0 0 */6 * * *".to_owned(),
             max_xml_size: 10,
+            max_message_size: 25,
+            max_attachment_size: 10,
         }
     }
 
@@ -356,5 +452,27 @@ mod tests {
         assert!(domain_aligned("example.com", "mail.example.com"));
         assert!(!domain_aligned("example.com", "example.net"));
         assert!(!domain_aligned("badexample.com", "example.com"));
+    }
+
+    #[test]
+    fn skips_attachment_that_exceeds_encoded_size_limit_before_decode() {
+        let parsed = mailparse::parse_mail(
+            b"Content-Type: application/xml; name=\"report.xml\"\r\nContent-Disposition: attachment; filename=\"report.xml\"\r\nContent-Transfer-Encoding: base64\r\n\r\ndGVzdA==",
+        )
+        .expect("message part should parse");
+        let mut out = Vec::new();
+
+        collect_attachments(
+            &parsed,
+            &mailbox(),
+            "INBOX/DMARC",
+            42,
+            "reports@example.com",
+            4,
+            &mut out,
+        )
+        .expect("oversized attachment should be skipped, not fail");
+
+        assert!(out.is_empty());
     }
 }

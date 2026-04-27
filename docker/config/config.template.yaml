@@ -19,3 +19,5 @@ imap:
       move_emails: true
       poll_cron: "0 0 */6 * * *"
       max_xml_size: 10
+      max_message_size: 25
+      max_attachment_size: 10

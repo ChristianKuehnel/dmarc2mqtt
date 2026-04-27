@@ -42,6 +42,10 @@ pub(crate) struct ImapMailboxConfig {
     pub(crate) poll_cron: String,
     #[serde(default = "default_max_xml_size")]
     pub(crate) max_xml_size: u64,
+    #[serde(default = "default_max_message_size")]
+    pub(crate) max_message_size: u64,
+    #[serde(default = "default_max_attachment_size")]
+    pub(crate) max_attachment_size: u64,
 }
 
 fn default_poll_cron() -> String {
@@ -49,6 +53,14 @@ fn default_poll_cron() -> String {
 }
 
 fn default_max_xml_size() -> u64 {
+    10
+}
+
+fn default_max_message_size() -> u64 {
+    25
+}
+
+fn default_max_attachment_size() -> u64 {
     10
 }
 
@@ -166,6 +178,18 @@ fn validate_mailboxes(mailboxes: &[ImapMailboxConfig]) -> Result<(), String> {
                 mailbox_name
             ));
         }
+        if mailbox.max_message_size == 0 {
+            return Err(format!(
+                "Config field imap.mailboxes['{}'].max_message_size must be greater than 0",
+                mailbox_name
+            ));
+        }
+        if mailbox.max_attachment_size == 0 {
+            return Err(format!(
+                "Config field imap.mailboxes['{}'].max_attachment_size must be greater than 0",
+                mailbox_name
+            ));
+        }
         cron::Schedule::from_str(&mailbox.poll_cron).map_err(|err| {
             format!(
                 "Config field imap.mailboxes['{}'].poll_cron is invalid ({}): {err}",
@@ -228,6 +252,8 @@ mod tests {
 
         assert!(config.mqtt.tls);
         assert!(!config.mqtt.allow_insecure);
+        assert_eq!(config.imap.mailboxes[0].max_message_size, 25);
+        assert_eq!(config.imap.mailboxes[0].max_attachment_size, 10);
     }
 
     #[test]
@@ -260,5 +286,23 @@ mod tests {
             .expect_err("plaintext IMAP port should be rejected");
 
         assert!(err.contains("plaintext IMAP port 143"));
+    }
+
+    #[test]
+    fn rejects_zero_imap_size_limits() {
+        let path = write_config(&format!("{}      max_message_size: 0\n", config_yaml("")));
+        let err = load_config(path.to_str().expect("test path should be valid unicode"))
+            .expect_err("zero max_message_size should be rejected");
+
+        assert!(err.contains("max_message_size"));
+
+        let path = write_config(&format!(
+            "{}      max_attachment_size: 0\n",
+            config_yaml("")
+        ));
+        let err = load_config(path.to_str().expect("test path should be valid unicode"))
+            .expect_err("zero max_attachment_size should be rejected");
+
+        assert!(err.contains("max_attachment_size"));
     }
 }
