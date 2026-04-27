@@ -39,12 +39,17 @@ pub(crate) fn scan_report_inputs(
                 summaries.push(scan_xml_bytes(&input.bytes, &input.source)?);
             }
             Some("gz") => {
-                let decompressed =
-                    decompress_gzip_bytes(&input.bytes, &input.source, max_xml_size_mb, max_xml_bytes)?;
+                let decompressed = decompress_gzip_bytes(
+                    &input.bytes,
+                    &input.source,
+                    max_xml_size_mb,
+                    max_xml_bytes,
+                )?;
                 summaries.push(scan_xml_bytes(&decompressed, &input.source)?);
             }
             Some("zip") => {
-                let zipped = scan_zip_bytes(&input.bytes, &input.source, max_xml_size_mb, max_xml_bytes)?;
+                let zipped =
+                    scan_zip_bytes(&input.bytes, &input.source, max_xml_size_mb, max_xml_bytes)?;
                 summaries.extend(zipped);
             }
             _ => {}
@@ -110,8 +115,8 @@ fn scan_zip_bytes(
     max_xml_bytes: usize,
 ) -> Result<Vec<ScanSummary>, String> {
     let cursor = Cursor::new(input);
-    let mut archive =
-        ZipArchive::new(cursor).map_err(|err| format!("Failed to read ZIP attachment {source}: {err}"))?;
+    let mut archive = ZipArchive::new(cursor)
+        .map_err(|err| format!("Failed to read ZIP attachment {source}: {err}"))?;
     let mut summaries = Vec::new();
 
     for index in 0..archive.len() {
@@ -232,5 +237,85 @@ fn local_name(name: &[u8]) -> String {
     match raw.rsplit_once(':') {
         Some((_, local)) => local.to_string(),
         None => raw.to_string(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct ExpectedSummary {
+        file_name: &'static str,
+        org_name: &'static str,
+        email: &'static str,
+        pass_count: usize,
+        fail_count: usize,
+    }
+
+    #[test]
+    fn scans_synthetic_dmarc_xml_fixtures() {
+        let fixtures = [
+            (
+                include_bytes!("../tests/fixtures/dmarc-yahoo.xml.gz").as_slice(),
+                ExpectedSummary {
+                    file_name: "dmarc-yahoo.xml.gz",
+                    org_name: "Yahoo",
+                    email: "dmarchelp@yahooinc.com",
+                    pass_count: 2,
+                    fail_count: 0,
+                },
+            ),
+            (
+                include_bytes!("../tests/fixtures/dmarc-gmx.xml").as_slice(),
+                ExpectedSummary {
+                    file_name: "dmarc-gmx.xml",
+                    org_name: "GMX",
+                    email: "noreply-dmarc@sicher.gmx.net",
+                    pass_count: 2,
+                    fail_count: 0,
+                },
+            ),
+            (
+                include_bytes!("../tests/fixtures/dmarc-outlook.xml").as_slice(),
+                ExpectedSummary {
+                    file_name: "dmarc-outlook.xml",
+                    org_name: "Enterprise Outlook",
+                    email: "dmarcreport@microsoft.com",
+                    pass_count: 6,
+                    fail_count: 0,
+                },
+            ),
+            (
+                include_bytes!("../tests/fixtures/dmarc-google.zip").as_slice(),
+                ExpectedSummary {
+                    file_name: "dmarc-google.zip",
+                    org_name: "google.com",
+                    email: "noreply-dmarc-support@google.com",
+                    pass_count: 16,
+                    fail_count: 0,
+                },
+            ),
+        ];
+
+        for (bytes, expected) in fixtures {
+            let input = ReportInput {
+                source: format!("fixture:{}", expected.file_name),
+                file_name: expected.file_name.to_owned(),
+                bytes: bytes.to_vec(),
+            };
+
+            let summaries = scan_report_inputs(&[input], 1).expect("fixture should parse");
+
+            assert_eq!(summaries.len(), 1);
+            let summary = &summaries[0];
+            assert_eq!(summary.org_name.as_deref(), Some(expected.org_name));
+            assert_eq!(summary.email.as_deref(), Some(expected.email));
+            assert_eq!(
+                summary.policy_published_domain.as_deref(),
+                Some("example.com")
+            );
+            assert_eq!(summary.result_pass_count, expected.pass_count);
+            assert_eq!(summary.result_fail_count, expected.fail_count);
+        }
     }
 }
