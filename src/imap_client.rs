@@ -1,10 +1,14 @@
 use crate::config::ImapMailboxConfig;
-use mailparse::ParsedMail;
+use log::warn;
+use mail_auth::common::verify::VerifySignature;
+use mail_auth::{AuthenticatedMessage, DkimResult, MessageAuthenticator};
+use mailparse::{MailAddr, MailHeaderMap, ParsedMail};
 
 #[derive(Debug, Clone)]
 pub(crate) struct ReportInput {
     pub(crate) source: String,
     pub(crate) file_name: String,
+    pub(crate) message_sender: String,
     pub(crate) bytes: Vec<u8>,
 }
 
@@ -19,23 +23,19 @@ pub(crate) fn fetch_messages_with_attachments(
 ) -> Result<Vec<MailMessage>, String> {
     let mut session = connect_and_login(mailbox)?;
     let folder = folder_path(mailbox);
-    session
-        .select(&folder)
-        .map_err(|err| {
-            format!(
-                "Failed to select IMAP folder {} for mailbox '{}': {err}",
-                folder, mailbox.name
-            )
-        })?;
+    session.select(&folder).map_err(|err| {
+        format!(
+            "Failed to select IMAP folder {} for mailbox '{}': {err}",
+            folder, mailbox.name
+        )
+    })?;
 
-    let ids = session
-        .uid_search("ALL")
-        .map_err(|err| {
-            format!(
-                "Failed to search IMAP folder {} for mailbox '{}': {err}",
-                folder, mailbox.name
-            )
-        })?;
+    let ids = session.uid_search("ALL").map_err(|err| {
+        format!(
+            "Failed to search IMAP folder {} for mailbox '{}': {err}",
+            folder, mailbox.name
+        )
+    })?;
 
     let mut sorted_ids: Vec<u32> = ids.into_iter().collect();
     sorted_ids.sort_unstable();
@@ -54,7 +54,9 @@ pub(crate) fn fetch_messages_with_attachments(
         for fetch in fetches.iter() {
             if let Some(raw) = fetch.body() {
                 let attachments = extract_attachment_inputs(raw, mailbox, &folder, uid)?;
-                messages.push(MailMessage { uid, attachments });
+                if !attachments.is_empty() {
+                    messages.push(MailMessage { uid, attachments });
+                }
             }
         }
     }
@@ -69,14 +71,12 @@ pub(crate) fn fetch_messages_with_attachments(
 pub(crate) fn move_message_to_trash(mailbox: &ImapMailboxConfig, uid: u32) -> Result<(), String> {
     let mut session = connect_and_login(mailbox)?;
     let source_folder = folder_path(mailbox);
-    session
-        .select(&source_folder)
-        .map_err(|err| {
-            format!(
-                "Failed to select IMAP folder {} for mailbox '{}': {err}",
-                source_folder, mailbox.name
-            )
-        })?;
+    session.select(&source_folder).map_err(|err| {
+        format!(
+            "Failed to select IMAP folder {} for mailbox '{}': {err}",
+            source_folder, mailbox.name
+        )
+    })?;
 
     session
         .uid_mv(uid.to_string(), &mailbox.trash_folder)
@@ -107,7 +107,12 @@ fn connect_and_login(
         })?;
     client
         .login(&mailbox.login, &mailbox.password)
-        .map_err(|(err, _)| format!("Failed to login to IMAP for mailbox '{}': {err}", mailbox.name))
+        .map_err(|(err, _)| {
+            format!(
+                "Failed to login to IMAP for mailbox '{}': {err}",
+                mailbox.name
+            )
+        })
 }
 
 fn folder_path(mailbox: &ImapMailboxConfig) -> String {
@@ -120,16 +125,32 @@ fn extract_attachment_inputs(
     folder: &str,
     message_uid: u32,
 ) -> Result<Vec<ReportInput>, String> {
-    let parsed = mailparse::parse_mail(raw_message)
-        .map_err(|err| {
-            format!(
-                "Failed to parse MIME message UID {message_uid} for mailbox '{}': {err}",
-                mailbox.name
-            )
-        })?;
+    let parsed = mailparse::parse_mail(raw_message).map_err(|err| {
+        format!(
+            "Failed to parse MIME message UID {message_uid} for mailbox '{}': {err}",
+            mailbox.name
+        )
+    })?;
+    let message_sender = message_sender(&parsed, mailbox, message_uid)?;
 
     let mut out = Vec::new();
-    collect_attachments(&parsed, mailbox, folder, message_uid, &mut out)?;
+    collect_attachments(
+        &parsed,
+        mailbox,
+        folder,
+        message_uid,
+        &message_sender,
+        &mut out,
+    )?;
+    if !out.is_empty() {
+        if let Err(err) = verify_dkim(raw_message, &message_sender) {
+            warn!(
+                "Skipping IMAP message UID {message_uid} for mailbox '{}': {err}",
+                mailbox.name
+            );
+            return Ok(Vec::new());
+        }
+    }
     Ok(out)
 }
 
@@ -138,11 +159,12 @@ fn collect_attachments(
     mailbox: &ImapMailboxConfig,
     folder: &str,
     message_uid: u32,
+    message_sender: &str,
     out: &mut Vec<ReportInput>,
 ) -> Result<(), String> {
     if !part.subparts.is_empty() {
         for child in &part.subparts {
-            collect_attachments(child, mailbox, folder, message_uid, out)?;
+            collect_attachments(child, mailbox, folder, message_uid, message_sender, out)?;
         }
         return Ok(());
     }
@@ -164,14 +186,12 @@ fn collect_attachments(
     }
 
     let file_name = file_name.unwrap_or_else(|| "attachment.bin".to_owned());
-    let bytes = part
-        .get_body_raw()
-        .map_err(|err| {
-            format!(
-                "Failed to decode attachment in message UID {message_uid} for mailbox '{}': {err}",
-                mailbox.name
-            )
-        })?;
+    let bytes = part.get_body_raw().map_err(|err| {
+        format!(
+            "Failed to decode attachment in message UID {message_uid} for mailbox '{}': {err}",
+            mailbox.name
+        )
+    })?;
 
     out.push(ReportInput {
         source: format!(
@@ -179,8 +199,161 @@ fn collect_attachments(
             mailbox.name, mailbox.server_name, folder
         ),
         file_name,
+        message_sender: message_sender.to_owned(),
         bytes,
     });
 
     Ok(())
+}
+
+fn message_sender(
+    parsed: &ParsedMail,
+    mailbox: &ImapMailboxConfig,
+    message_uid: u32,
+) -> Result<String, String> {
+    let header = parsed
+        .headers
+        .get_first_header("Sender")
+        .or_else(|| parsed.headers.get_first_header("From"))
+        .ok_or_else(|| {
+            format!(
+                "Message UID {message_uid} for mailbox '{}' has no Sender or From header",
+                mailbox.name
+            )
+        })?;
+
+    let addresses = mailparse::addrparse_header(header).map_err(|err| {
+        format!(
+            "Failed to parse sender header in message UID {message_uid} for mailbox '{}': {err}",
+            mailbox.name
+        )
+    })?;
+    let mut senders = Vec::new();
+    for address in addresses.iter() {
+        collect_mail_addresses(address, &mut senders);
+    }
+
+    if senders.len() != 1 {
+        return Err(format!(
+            "Message UID {message_uid} for mailbox '{}' must have exactly one sender address, found {}",
+            mailbox.name,
+            senders.len()
+        ));
+    }
+
+    Ok(senders.remove(0).to_ascii_lowercase())
+}
+
+fn collect_mail_addresses(address: &MailAddr, out: &mut Vec<String>) {
+    match address {
+        MailAddr::Single(info) => out.push(info.addr.clone()),
+        MailAddr::Group(group) => {
+            for address in &group.addrs {
+                out.push(address.addr.clone());
+            }
+        }
+    }
+}
+
+fn verify_dkim(raw_message: &[u8], message_sender: &str) -> Result<(), String> {
+    let authenticated_message = AuthenticatedMessage::parse(raw_message)
+        .ok_or_else(|| "Message could not be parsed for DKIM verification".to_owned())?;
+    let sender_domain = email_domain(message_sender)
+        .ok_or_else(|| format!("Message sender '{message_sender}' has no domain"))?;
+    let authenticator = MessageAuthenticator::new_system_conf()
+        .map_err(|err| format!("Failed to initialize DKIM DNS resolver: {err}"))?;
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|err| format!("Failed to initialize DKIM runtime: {err}"))?;
+    let results = runtime.block_on(authenticator.verify_dkim(&authenticated_message));
+
+    if results.is_empty() {
+        return Err("Message has no DKIM signature".to_owned());
+    }
+
+    if results.iter().any(|result| {
+        result.result() == &DkimResult::Pass
+            && result.signature().is_some_and(|signature| {
+                domain_aligned(sender_domain, signature.domain())
+                    || email_domain(signature.identity()).is_some_and(|identity_domain| {
+                        domain_aligned(sender_domain, identity_domain)
+                    })
+            })
+    }) {
+        Ok(())
+    } else {
+        let details = results
+            .iter()
+            .map(|result| result.result().to_string())
+            .collect::<Vec<_>>()
+            .join(", ");
+        Err(format!(
+            "Message has no passing DKIM signature aligned with sender '{message_sender}' ({details})"
+        ))
+    }
+}
+
+fn email_domain(email: &str) -> Option<&str> {
+    email
+        .rsplit_once('@')
+        .map(|(_, domain)| domain.trim().trim_end_matches('.'))
+        .filter(|domain| !domain.is_empty())
+}
+
+fn domain_aligned(left: &str, right: &str) -> bool {
+    let left = left.trim().trim_end_matches('.').to_ascii_lowercase();
+    let right = right.trim().trim_end_matches('.').to_ascii_lowercase();
+    left == right || left.ends_with(&format!(".{right}")) || right.ends_with(&format!(".{left}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn mailbox() -> ImapMailboxConfig {
+        ImapMailboxConfig {
+            name: "primary".to_owned(),
+            server_name: "imap.example.com".to_owned(),
+            server_port: 993,
+            login: "user@example.com".to_owned(),
+            password: "change-me".to_owned(),
+            report_folder: "INBOX/DMARC".to_owned(),
+            trash_folder: "Trash".to_owned(),
+            move_emails: false,
+            poll_cron: "0 0 */6 * * *".to_owned(),
+            max_xml_size: 10,
+        }
+    }
+
+    #[test]
+    fn sender_header_takes_precedence_over_from() {
+        let parsed = mailparse::parse_mail(
+            b"From: Spoof <spoof@example.net>\r\nSender: Reports <reports@example.com>\r\n\r\nBody",
+        )
+        .expect("message should parse");
+
+        let sender = message_sender(&parsed, &mailbox(), 42).expect("sender should parse");
+
+        assert_eq!(sender, "reports@example.com");
+    }
+
+    #[test]
+    fn rejects_multiple_from_addresses_without_sender() {
+        let parsed = mailparse::parse_mail(b"From: one@example.com, two@example.com\r\n\r\nBody")
+            .expect("message should parse");
+
+        let err = message_sender(&parsed, &mailbox(), 42).expect_err("sender should be ambiguous");
+
+        assert!(err.contains("exactly one sender address"));
+    }
+
+    #[test]
+    fn dkim_domains_align_with_sender_domain_or_subdomain() {
+        assert!(domain_aligned("example.com", "example.com"));
+        assert!(domain_aligned("reports.example.com", "example.com"));
+        assert!(domain_aligned("example.com", "mail.example.com"));
+        assert!(!domain_aligned("example.com", "example.net"));
+        assert!(!domain_aligned("badexample.com", "example.com"));
+    }
 }

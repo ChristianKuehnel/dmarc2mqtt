@@ -36,7 +36,9 @@ pub(crate) fn scan_report_inputs(
                         input.source, max_xml_size_mb
                     ));
                 }
-                summaries.push(scan_xml_bytes(&input.bytes, &input.source)?);
+                let summary = scan_xml_bytes(&input.bytes, &input.source)?;
+                validate_report_sender(&summary, &input.message_sender)?;
+                summaries.push(summary);
             }
             Some("gz") => {
                 let decompressed = decompress_gzip_bytes(
@@ -45,11 +47,16 @@ pub(crate) fn scan_report_inputs(
                     max_xml_size_mb,
                     max_xml_bytes,
                 )?;
-                summaries.push(scan_xml_bytes(&decompressed, &input.source)?);
+                let summary = scan_xml_bytes(&decompressed, &input.source)?;
+                validate_report_sender(&summary, &input.message_sender)?;
+                summaries.push(summary);
             }
             Some("zip") => {
                 let zipped =
                     scan_zip_bytes(&input.bytes, &input.source, max_xml_size_mb, max_xml_bytes)?;
+                for summary in &zipped {
+                    validate_report_sender(summary, &input.message_sender)?;
+                }
                 summaries.extend(zipped);
             }
             _ => {}
@@ -57,6 +64,27 @@ pub(crate) fn scan_report_inputs(
     }
 
     Ok(summaries)
+}
+
+fn validate_report_sender(summary: &ScanSummary, message_sender: &str) -> Result<(), String> {
+    let report_email = summary.email.as_deref().ok_or_else(|| {
+        format!(
+            "DMARC report {} is missing report_metadata/email and cannot be authenticated against message sender {}.",
+            summary.source, message_sender
+        )
+    })?;
+
+    if report_email
+        .trim()
+        .eq_ignore_ascii_case(message_sender.trim())
+    {
+        Ok(())
+    } else {
+        Err(format!(
+            "DMARC report {} claims report_metadata/email '{}' but message sender is '{}'.",
+            summary.source, report_email, message_sender
+        ))
+    }
 }
 
 fn max_xml_size_bytes(max_xml_size_mb: u64) -> Result<usize, String> {
@@ -301,6 +329,7 @@ mod tests {
             let input = ReportInput {
                 source: format!("fixture:{}", expected.file_name),
                 file_name: expected.file_name.to_owned(),
+                message_sender: expected.email.to_owned(),
                 bytes: bytes.to_vec(),
             };
 
@@ -317,5 +346,20 @@ mod tests {
             assert_eq!(summary.result_pass_count, expected.pass_count);
             assert_eq!(summary.result_fail_count, expected.fail_count);
         }
+    }
+
+    #[test]
+    fn rejects_report_email_that_does_not_match_message_sender() {
+        let input = ReportInput {
+            source: "fixture:dmarc-gmx.xml".to_owned(),
+            file_name: "dmarc-gmx.xml".to_owned(),
+            message_sender: "attacker@example.com".to_owned(),
+            bytes: include_bytes!("../tests/fixtures/dmarc-gmx.xml").to_vec(),
+        };
+
+        let err = scan_report_inputs(&[input], 1).expect_err("sender mismatch should fail");
+
+        assert!(err.contains("claims report_metadata/email"));
+        assert!(err.contains("attacker@example.com"));
     }
 }
