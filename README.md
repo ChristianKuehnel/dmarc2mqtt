@@ -57,12 +57,12 @@ Each mailbox has its own connection settings, folders, schedule and `max_xml_siz
 `imap.mailboxes[].max_xml_size` defines the maximum allowed uncompressed XML payload size in MB (applies to XML, GZIP and ZIP attachments).
 
 
-## Docker
+## Container Image
 
-Build the image:
+Published images are available from GitHub Container Registry:
 
-```bash
-docker build -t dmarc2mqtt:latest .
+```text
+ghcr.io/christiankuehnel/dmarc2mqtt:latest
 ```
 
 Use a mounted config directory. A starter config is included at `docker/config/config.template.yaml`.
@@ -73,13 +73,32 @@ Create your runtime config file:
 cp docker/config/config.template.yaml docker/config/config.yaml
 ```
 
+Run with Docker:
+
 ```bash
 docker run --rm \
-  -v "$(pwd)/docker/config:/config:ro" \
-  dmarc2mqtt:latest
+  --name dmarc2mqtt \
+  -v "$(pwd)/docker/config:/config" \
+  ghcr.io/christiankuehnel/dmarc2mqtt:latest
+```
+
+Run with Podman:
+
+```bash
+podman run --rm \
+  --name dmarc2mqtt \
+  -v "$(pwd)/docker/config:/config:Z" \
+  ghcr.io/christiankuehnel/dmarc2mqtt:latest
 ```
 
 The container entrypoint reads `/config/config.yaml`, so edit the host file at `docker/config/config.yaml` (or mount your own directory with a `config.yaml` file).
+The container writes `history.json` next to the mounted config file, so the mounted directory must be writable if you want history to persist.
+
+To build the image locally instead:
+
+```bash
+docker build -t dmarc2mqtt:latest .
+```
 
 ## MQTT Output
 
