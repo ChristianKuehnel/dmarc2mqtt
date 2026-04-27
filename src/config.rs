@@ -21,6 +21,12 @@ pub(crate) struct MqttConfig {
 
 #[derive(Debug, Deserialize)]
 pub(crate) struct ImapConfig {
+    pub(crate) mailboxes: Vec<ImapMailboxConfig>,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub(crate) struct ImapMailboxConfig {
+    pub(crate) name: String,
     pub(crate) server_name: String,
     pub(crate) server_port: u16,
     pub(crate) login: String,
@@ -63,41 +69,88 @@ pub(crate) fn load_config(path: &str) -> Result<AppConfig, String> {
     if config.mqtt.server_port == 0 {
         return Err("Config field mqtt.server_port must be greater than 0".to_owned());
     }
-    if config.imap.server_name.trim().is_empty() {
-        return Err("Config field imap.server_name must not be empty".to_owned());
-    }
-    if config.imap.login.trim().is_empty() {
-        return Err("Config field imap.login must not be empty".to_owned());
-    }
-    if config.imap.password.trim().is_empty() {
-        return Err("Config field imap.password must not be empty".to_owned());
-    }
-    if config.imap.report_folder.trim().is_empty() {
-        return Err("Config field imap.report_folder must not be empty".to_owned());
-    }
-    if config.imap.trash_folder.trim().is_empty() {
-        return Err("Config field imap.trash_folder must not be empty".to_owned());
-    }
-    if config.imap.server_port == 0 {
-        return Err("Config field imap.server_port must be greater than 0".to_owned());
-    }
-    if config.imap.poll_cron.trim().is_empty() {
-        return Err("Config field imap.poll_cron must not be empty".to_owned());
-    }
-    if config.imap.max_xml_size == 0 {
-        return Err("Config field imap.max_xml_size must be greater than 0".to_owned());
-    }
     if matches!(config.mqtt.remove_stale_sensors, Some(0)) {
         return Err(
             "Config field mqtt.remove_stale_sensors must be greater than 0 when set".to_owned(),
         );
     }
-    cron::Schedule::from_str(&config.imap.poll_cron).map_err(|err| {
-        format!(
-            "Config field imap.poll_cron is invalid ({}): {err}",
-            config.imap.poll_cron
-        )
-    })?;
+    validate_mailboxes(&config.imap.mailboxes)?;
 
     Ok(config)
+}
+
+fn validate_mailboxes(mailboxes: &[ImapMailboxConfig]) -> Result<(), String> {
+    if mailboxes.is_empty() {
+        return Err("Config field imap.mailboxes must contain at least one mailbox".to_owned());
+    }
+
+    let mut seen_names = std::collections::BTreeSet::new();
+    for mailbox in mailboxes {
+        let mailbox_name = mailbox.name.trim();
+        if mailbox_name.is_empty() {
+            return Err("Config field imap.mailboxes[].name must not be empty".to_owned());
+        }
+        if !seen_names.insert(mailbox_name.to_owned()) {
+            return Err(format!(
+                "Config field imap.mailboxes contains duplicate mailbox name '{}'",
+                mailbox_name
+            ));
+        }
+        if mailbox.server_name.trim().is_empty() {
+            return Err(format!(
+                "Config field imap.mailboxes['{}'].server_name must not be empty",
+                mailbox_name
+            ));
+        }
+        if mailbox.login.trim().is_empty() {
+            return Err(format!(
+                "Config field imap.mailboxes['{}'].login must not be empty",
+                mailbox_name
+            ));
+        }
+        if mailbox.password.trim().is_empty() {
+            return Err(format!(
+                "Config field imap.mailboxes['{}'].password must not be empty",
+                mailbox_name
+            ));
+        }
+        if mailbox.report_folder.trim().is_empty() {
+            return Err(format!(
+                "Config field imap.mailboxes['{}'].report_folder must not be empty",
+                mailbox_name
+            ));
+        }
+        if mailbox.trash_folder.trim().is_empty() {
+            return Err(format!(
+                "Config field imap.mailboxes['{}'].trash_folder must not be empty",
+                mailbox_name
+            ));
+        }
+        if mailbox.server_port == 0 {
+            return Err(format!(
+                "Config field imap.mailboxes['{}'].server_port must be greater than 0",
+                mailbox_name
+            ));
+        }
+        if mailbox.poll_cron.trim().is_empty() {
+            return Err(format!(
+                "Config field imap.mailboxes['{}'].poll_cron must not be empty",
+                mailbox_name
+            ));
+        }
+        if mailbox.max_xml_size == 0 {
+            return Err(format!(
+                "Config field imap.mailboxes['{}'].max_xml_size must be greater than 0",
+                mailbox_name
+            ));
+        }
+        cron::Schedule::from_str(&mailbox.poll_cron).map_err(|err| {
+            format!(
+                "Config field imap.mailboxes['{}'].poll_cron is invalid ({}): {err}",
+                mailbox_name, mailbox.poll_cron
+            )
+        })?;
+    }
+
+    Ok(())
 }

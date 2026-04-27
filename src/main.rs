@@ -14,6 +14,7 @@ use std::time::Duration;
 
 use chrono::{DateTime, Local, Utc};
 use cron::Schedule;
+use config::{AppConfig, ImapMailboxConfig};
 use env_logger::Env;
 use log::{error, info};
 use parser::ScanSummary;
@@ -42,63 +43,102 @@ fn run() -> Result<(), String> {
     let args = parse_args()?;
     let config = config::load_config(&args.config_path)?;
     let history_path = history::history_path_for_config(&args.config_path);
+    let mut mailbox_last_run = BTreeMap::new();
 
     info!(
-        "Starting daemon poll loop for IMAP folder '{}' with schedule '{}'.",
-        config.imap.report_folder, config.imap.poll_cron
+        "Starting daemon poll loop for {} configured IMAP mailbox(es).",
+        config.imap.mailboxes.len()
     );
+    for mailbox in &config.imap.mailboxes {
+        info!(
+            "Configured mailbox '{}': {}:{} folder '{}' schedule '{}'.",
+            mailbox.name,
+            mailbox.server_name,
+            mailbox.server_port,
+            mailbox.report_folder,
+            mailbox.poll_cron
+        );
+    }
     info!("History file path: {}", history_path.display());
 
-    process_once(&config, &history_path);
+    process_mailboxes(&config, &history_path, &config.imap.mailboxes, &mut mailbox_last_run);
 
     loop {
         let config_for_schedule = config::load_config(&args.config_path)?;
-        let schedule = parse_schedule(&config_for_schedule.imap.poll_cron)?;
-        let next_run = next_tick(&schedule)?;
+        let next_run = next_due_mailbox_run(&config_for_schedule, &mailbox_last_run)?;
         let wait = until(next_run);
         info!(
-            "Next polling run at {} (in {}) using schedule '{}'.",
+            "Next polling run at {} (in {}).",
             next_run.with_timezone(&Local).format("%Y-%m-%d %H:%M:%S %Z"),
             human_duration(wait),
-            config_for_schedule.imap.poll_cron
         );
         thread::sleep(wait);
 
         let config_for_run = config::load_config(&args.config_path)?;
-        process_once(&config_for_run, &history_path);
+        let due_mailboxes = due_mailboxes(&config_for_run, &mailbox_last_run, Utc::now())?;
+        if due_mailboxes.is_empty() {
+            continue;
+        }
+        process_mailboxes(
+            &config_for_run,
+            &history_path,
+            &due_mailboxes,
+            &mut mailbox_last_run,
+        );
     }
 }
 
 fn parse_schedule(cron_expression: &str) -> Result<Schedule, String> {
-    Schedule::from_str(cron_expression).map_err(|err| {
-        format!("Config field imap.poll_cron is invalid ({cron_expression}): {err}")
-    })
+    Schedule::from_str(cron_expression)
+        .map_err(|err| format!("Invalid poll_cron ({cron_expression}): {err}"))
 }
 
-fn process_once(config: &config::AppConfig, history_path: &Path) {
-    info!("Starting IMAP polling cycle.");
+fn process_mailboxes(
+    config: &AppConfig,
+    history_path: &Path,
+    mailboxes: &[ImapMailboxConfig],
+    mailbox_last_run: &mut BTreeMap<String, DateTime<Utc>>,
+) {
+    info!(
+        "Starting IMAP polling cycle for mailbox(es): {}.",
+        mailbox_names(mailboxes)
+    );
 
-    if let Err(err) = process_once_inner(config, history_path) {
+    if let Err(err) = process_mailboxes_inner(config, history_path, mailboxes, mailbox_last_run) {
         error!("Polling cycle failed: {err}");
     }
 }
 
-fn process_once_inner(config: &config::AppConfig, history_path: &Path) -> Result<(), String> {
-    let messages = imap_client::fetch_messages_with_attachments(config)?;
+fn process_mailboxes_inner(
+    config: &AppConfig,
+    history_path: &Path,
+    mailboxes: &[ImapMailboxConfig],
+    mailbox_last_run: &mut BTreeMap<String, DateTime<Utc>>,
+) -> Result<(), String> {
     let mut summaries = Vec::new();
-    let mut message_uids_to_move = Vec::new();
+    let mut message_uids_to_move: Vec<(String, u32)> = Vec::new();
     let mut moved_to_trash = 0usize;
 
-    for message in messages {
-        let parsed = parser::scan_report_inputs(&message.attachments, config.imap.max_xml_size)?;
-        if parsed.is_empty() {
-            continue;
+    for mailbox in mailboxes {
+        info!(
+            "Polling mailbox '{}': {}:{} folder '{}'.",
+            mailbox.name, mailbox.server_name, mailbox.server_port, mailbox.report_folder
+        );
+
+        let messages = imap_client::fetch_messages_with_attachments(mailbox)?;
+        for message in messages {
+            let parsed = parser::scan_report_inputs(&message.attachments, mailbox.max_xml_size)?;
+            if parsed.is_empty() {
+                continue;
+            }
+
+            summaries.extend(parsed);
+            if mailbox.move_emails {
+                message_uids_to_move.push((mailbox.name.clone(), message.uid));
+            }
         }
 
-        summaries.extend(parsed);
-        if config.imap.move_emails {
-            message_uids_to_move.push(message.uid);
-        }
+        mailbox_last_run.insert(mailbox.name.clone(), Utc::now());
     }
 
     let history_update = history::update_history(history_path, &summaries)?;
@@ -125,7 +165,7 @@ fn process_once_inner(config: &config::AppConfig, history_path: &Path) -> Result
 
     if summaries.is_empty() {
         info!(
-            "No supported attachments found in configured IMAP folder. Expected .xml, .gz, or .zip attachments."
+            "No supported attachments found in the polled IMAP mailboxes. Expected .xml, .gz, or .zip attachments."
         );
     }
 
@@ -154,29 +194,88 @@ fn process_once_inner(config: &config::AppConfig, history_path: &Path) -> Result
 
     mqtt::publish_reports_to_mqtt(config, &aggregated_statuses, &domain_statuses, &known_tuples)?;
 
-    if config.imap.move_emails {
-        for uid in message_uids_to_move {
-            imap_client::move_message_to_trash(config, uid)?;
+    for (mailbox_name, uid) in message_uids_to_move {
+        let mailbox = config
+            .imap
+            .mailboxes
+            .iter()
+            .find(|mailbox| mailbox.name == mailbox_name)
+            .ok_or_else(|| format!("Configured mailbox '{}' disappeared during processing", mailbox_name))?;
+        if mailbox.move_emails {
+            imap_client::move_message_to_trash(mailbox, uid)?;
             moved_to_trash += 1;
         }
     }
 
     info!("Published reports to MQTT.");
-    if config.imap.move_emails {
+    if mailboxes.iter().any(|mailbox| mailbox.move_emails) {
         info!("Moved emails to trash: {moved_to_trash}");
     } else {
-        info!("Move emails disabled (imap.move_emails=false).");
+        info!("Move emails disabled for the processed mailboxes.");
     }
     info!("Total documents: {}", summaries.len());
 
     Ok(())
 }
 
-fn next_tick(schedule: &Schedule) -> Result<DateTime<Utc>, String> {
-    schedule
-        .upcoming(Utc)
-        .next()
-        .ok_or_else(|| "Polling schedule has no upcoming execution time".to_owned())
+fn next_tick_after(schedule: &Schedule, reference: DateTime<Utc>) -> Result<DateTime<Utc>, String> {
+    schedule.after(&reference).next().ok_or_else(|| {
+        "Polling schedule has no upcoming execution time".to_owned()
+    })
+}
+
+fn next_due_mailbox_run(
+    config: &AppConfig,
+    mailbox_last_run: &BTreeMap<String, DateTime<Utc>>,
+) -> Result<DateTime<Utc>, String> {
+    let now = Utc::now();
+    let mut next_runs = Vec::new();
+
+    for mailbox in &config.imap.mailboxes {
+        match mailbox_last_run.get(&mailbox.name).copied() {
+            Some(last_run) => {
+                let schedule = parse_schedule(&mailbox.poll_cron)?;
+                next_runs.push(next_tick_after(&schedule, last_run)?);
+            }
+            None => return Ok(now),
+        }
+    }
+
+    next_runs
+        .into_iter()
+        .min()
+        .ok_or_else(|| "No IMAP mailboxes configured".to_owned())
+}
+
+fn due_mailboxes(
+    config: &AppConfig,
+    mailbox_last_run: &BTreeMap<String, DateTime<Utc>>,
+    now: DateTime<Utc>,
+) -> Result<Vec<ImapMailboxConfig>, String> {
+    let mut due = Vec::new();
+
+    for mailbox in &config.imap.mailboxes {
+        let Some(last_run) = mailbox_last_run.get(&mailbox.name).copied() else {
+            due.push(mailbox.clone());
+            continue;
+        };
+
+        let schedule = parse_schedule(&mailbox.poll_cron)?;
+        let next_run = next_tick_after(&schedule, last_run)?;
+        if next_run <= now {
+            due.push(mailbox.clone());
+        }
+    }
+
+    Ok(due)
+}
+
+fn mailbox_names(mailboxes: &[ImapMailboxConfig]) -> String {
+    mailboxes
+        .iter()
+        .map(|mailbox| mailbox.name.as_str())
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 fn until(next_run: DateTime<Utc>) -> Duration {

@@ -57,9 +57,9 @@ pub(crate) fn scan_report_inputs(
 fn max_xml_size_bytes(max_xml_size_mb: u64) -> Result<usize, String> {
     let bytes_u64 = max_xml_size_mb
         .checked_mul(1024 * 1024)
-        .ok_or_else(|| format!("Config field imap.max_xml_size is too large: {max_xml_size_mb}"))?;
+        .ok_or_else(|| format!("Configured max_xml_size is too large: {max_xml_size_mb}"))?;
     usize::try_from(bytes_u64)
-        .map_err(|_| format!("Config field imap.max_xml_size is too large: {max_xml_size_mb}"))
+        .map_err(|_| format!("Configured max_xml_size is too large: {max_xml_size_mb}"))
 }
 
 fn gzip_uncompressed_size_hint(input: &[u8]) -> Option<u64> {
@@ -89,7 +89,7 @@ fn decompress_gzip_bytes(
     let mut decompressed = Vec::new();
     let limit = max_xml_bytes
         .checked_add(1)
-        .ok_or_else(|| format!("Config field imap.max_xml_size is too large: {max_xml_size_mb}"))?;
+        .ok_or_else(|| format!("Configured max_xml_size is too large: {max_xml_size_mb}"))?;
     decoder
         .take(limit as u64)
         .read_to_end(&mut decompressed)

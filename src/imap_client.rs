@@ -1,4 +1,4 @@
-use crate::config::AppConfig;
+use crate::config::ImapMailboxConfig;
 use mailparse::ParsedMail;
 
 #[derive(Debug, Clone)]
@@ -14,16 +14,28 @@ pub(crate) struct MailMessage {
     pub(crate) attachments: Vec<ReportInput>,
 }
 
-pub(crate) fn fetch_messages_with_attachments(config: &AppConfig) -> Result<Vec<MailMessage>, String> {
-    let mut session = connect_and_login(config)?;
-    let folder = folder_path(config);
+pub(crate) fn fetch_messages_with_attachments(
+    mailbox: &ImapMailboxConfig,
+) -> Result<Vec<MailMessage>, String> {
+    let mut session = connect_and_login(mailbox)?;
+    let folder = folder_path(mailbox);
     session
         .select(&folder)
-        .map_err(|err| format!("Failed to select IMAP folder {folder}: {err}"))?;
+        .map_err(|err| {
+            format!(
+                "Failed to select IMAP folder {} for mailbox '{}': {err}",
+                folder, mailbox.name
+            )
+        })?;
 
     let ids = session
         .uid_search("ALL")
-        .map_err(|err| format!("Failed to search IMAP folder {folder}: {err}"))?;
+        .map_err(|err| {
+            format!(
+                "Failed to search IMAP folder {} for mailbox '{}': {err}",
+                folder, mailbox.name
+            )
+        })?;
 
     let mut sorted_ids: Vec<u32> = ids.into_iter().collect();
     sorted_ids.sort_unstable();
@@ -32,11 +44,16 @@ pub(crate) fn fetch_messages_with_attachments(config: &AppConfig) -> Result<Vec<
     for uid in sorted_ids {
         let fetches = session
             .uid_fetch(uid.to_string(), "RFC822")
-            .map_err(|err| format!("Failed to fetch IMAP message UID {uid}: {err}"))?;
+            .map_err(|err| {
+                format!(
+                    "Failed to fetch IMAP message UID {uid} for mailbox '{}': {err}",
+                    mailbox.name
+                )
+            })?;
 
         for fetch in fetches.iter() {
             if let Some(raw) = fetch.body() {
-                let attachments = extract_attachment_inputs(raw, &folder, uid)?;
+                let attachments = extract_attachment_inputs(raw, mailbox, &folder, uid)?;
                 messages.push(MailMessage { uid, attachments });
             }
         }
@@ -49,19 +66,24 @@ pub(crate) fn fetch_messages_with_attachments(config: &AppConfig) -> Result<Vec<
     Ok(messages)
 }
 
-pub(crate) fn move_message_to_trash(config: &AppConfig, uid: u32) -> Result<(), String> {
-    let mut session = connect_and_login(config)?;
-    let source_folder = folder_path(config);
+pub(crate) fn move_message_to_trash(mailbox: &ImapMailboxConfig, uid: u32) -> Result<(), String> {
+    let mut session = connect_and_login(mailbox)?;
+    let source_folder = folder_path(mailbox);
     session
         .select(&source_folder)
-        .map_err(|err| format!("Failed to select IMAP folder {source_folder}: {err}"))?;
-
-    session
-        .uid_mv(uid.to_string(), &config.imap.trash_folder)
         .map_err(|err| {
             format!(
-                "Failed to move IMAP message UID {uid} to trash folder {}: {err}",
-                config.imap.trash_folder
+                "Failed to select IMAP folder {} for mailbox '{}': {err}",
+                source_folder, mailbox.name
+            )
+        })?;
+
+    session
+        .uid_mv(uid.to_string(), &mailbox.trash_folder)
+        .map_err(|err| {
+            format!(
+                "Failed to move IMAP message UID {uid} to trash folder {} for mailbox '{}': {err}",
+                mailbox.trash_folder, mailbox.name
             )
         })?;
 
@@ -73,47 +95,54 @@ pub(crate) fn move_message_to_trash(config: &AppConfig, uid: u32) -> Result<(), 
 }
 
 fn connect_and_login(
-    config: &AppConfig,
+    mailbox: &ImapMailboxConfig,
 ) -> Result<imap::Session<imap::Connection>, String> {
-    let client = imap::ClientBuilder::new(&config.imap.server_name, config.imap.server_port)
+    let client = imap::ClientBuilder::new(&mailbox.server_name, mailbox.server_port)
         .connect()
         .map_err(|err| {
             format!(
-                "Failed to establish IMAP TLS connection to {}:{}: {err}",
-                config.imap.server_name, config.imap.server_port
+                "Failed to establish IMAP TLS connection to {}:{} for mailbox '{}': {err}",
+                mailbox.server_name, mailbox.server_port, mailbox.name
             )
         })?;
     client
-        .login(&config.imap.login, &config.imap.password)
-        .map_err(|(err, _)| format!("Failed to login to IMAP: {err}"))
+        .login(&mailbox.login, &mailbox.password)
+        .map_err(|(err, _)| format!("Failed to login to IMAP for mailbox '{}': {err}", mailbox.name))
 }
 
-fn folder_path(config: &AppConfig) -> String {
-    config.imap.report_folder.clone()
+fn folder_path(mailbox: &ImapMailboxConfig) -> String {
+    mailbox.report_folder.clone()
 }
 
 fn extract_attachment_inputs(
     raw_message: &[u8],
+    mailbox: &ImapMailboxConfig,
     folder: &str,
     message_uid: u32,
 ) -> Result<Vec<ReportInput>, String> {
     let parsed = mailparse::parse_mail(raw_message)
-        .map_err(|err| format!("Failed to parse MIME message UID {message_uid}: {err}"))?;
+        .map_err(|err| {
+            format!(
+                "Failed to parse MIME message UID {message_uid} for mailbox '{}': {err}",
+                mailbox.name
+            )
+        })?;
 
     let mut out = Vec::new();
-    collect_attachments(&parsed, folder, message_uid, &mut out)?;
+    collect_attachments(&parsed, mailbox, folder, message_uid, &mut out)?;
     Ok(out)
 }
 
 fn collect_attachments(
     part: &ParsedMail,
+    mailbox: &ImapMailboxConfig,
     folder: &str,
     message_uid: u32,
     out: &mut Vec<ReportInput>,
 ) -> Result<(), String> {
     if !part.subparts.is_empty() {
         for child in &part.subparts {
-            collect_attachments(child, folder, message_uid, out)?;
+            collect_attachments(child, mailbox, folder, message_uid, out)?;
         }
         return Ok(());
     }
@@ -137,10 +166,18 @@ fn collect_attachments(
     let file_name = file_name.unwrap_or_else(|| "attachment.bin".to_owned());
     let bytes = part
         .get_body_raw()
-        .map_err(|err| format!("Failed to decode attachment in message UID {message_uid}: {err}"))?;
+        .map_err(|err| {
+            format!(
+                "Failed to decode attachment in message UID {message_uid} for mailbox '{}': {err}",
+                mailbox.name
+            )
+        })?;
 
     out.push(ReportInput {
-        source: format!("imap:{folder}#{message_uid}:{file_name}"),
+        source: format!(
+            "imap:{}:{}:{}#{message_uid}:{file_name}",
+            mailbox.name, mailbox.server_name, folder
+        ),
         file_name,
         bytes,
     });

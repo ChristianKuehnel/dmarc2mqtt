@@ -6,12 +6,14 @@ mqtt:
   base_topic: "mail/dmarc"
   remove_stale_sensors: 30
 imap:
-  server_name: "imap.example.com"
-  server_port: 993
-  login: "user@example.com"
-  password: "change-me"
-  report_folder: "INBOX/DMARC"
-  trash_folder: "INBOX/Trash"
-  move_emails: false
-  poll_cron: "0 0 */6 * * *"
-  max_xml_size: 10
+  mailboxes:
+    - name: "primary"
+      server_name: "imap.example.com"
+      server_port: 993
+      login: "user@example.com"
+      password: "change-me"
+      report_folder: "INBOX/DMARC"
+      trash_folder: "INBOX/Trash"
+      move_emails: false
+      poll_cron: "0 0 */6 * * *"
+      max_xml_size: 10
