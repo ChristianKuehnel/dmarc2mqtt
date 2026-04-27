@@ -2,21 +2,7 @@
 
 Reads DMARC reports from one or more IMAP mailboxes and forwards processed reports via MQTT to be integrated in home automation systems like Home Assistant.
 
-    Note: This program was mostly coded by AI and wasn't reviewed thoroughly. So it mit do weird things.
-
-## Feature Roadmap
-1. [x] read xml
-1. [x] extract a few key results
-1. [ ] validate xml
-2. [x] Push to mqtt
-3. [x] publish HA sensor config
-4. [x] Read zipped files
-1. [x] validate zip security
-5. [x] read from imap and move to trash
-6. [x] add persistent storage to avoid flapping sensors, remove sensor after x days
-7. [ ] add more values/sensors?
-1. [x] wrap in docker container
-1. [x] re-read config before every execution (not only at startup)
+    Note: This program was mostly coded by AI and wasn't reviewed thoroughly. So it might do weird things.
 
 ## Design considerations
 
