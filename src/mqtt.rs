@@ -31,6 +31,9 @@ pub(crate) fn publish_reports_to_mqtt(
         config.mqtt.server_name.clone(),
         config.mqtt.server_port,
     );
+    if config.mqtt.tls {
+        mqtt_options.set_transport(rumqttc::Transport::tls_with_default_config());
+    }
     mqtt_options.set_credentials(config.mqtt.login.clone(), config.mqtt.password.clone());
     mqtt_options.set_keep_alive(Duration::from_secs(10));
 

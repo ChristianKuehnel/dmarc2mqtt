@@ -15,6 +15,10 @@ pub(crate) struct MqttConfig {
     pub(crate) login: String,
     pub(crate) password: String,
     pub(crate) base_topic: String,
+    #[serde(default = "default_mqtt_tls")]
+    pub(crate) tls: bool,
+    #[serde(default)]
+    pub(crate) allow_insecure: bool,
     #[serde(default)]
     pub(crate) remove_stale_sensors: Option<u64>,
 }
@@ -48,6 +52,10 @@ fn default_max_xml_size() -> u64 {
     10
 }
 
+fn default_mqtt_tls() -> bool {
+    true
+}
+
 pub(crate) fn load_config(path: &str) -> Result<AppConfig, String> {
     let content = fs::read_to_string(path)
         .map_err(|err| format!("Failed to read config file {path}: {err}"))?;
@@ -68,6 +76,14 @@ pub(crate) fn load_config(path: &str) -> Result<AppConfig, String> {
     }
     if config.mqtt.server_port == 0 {
         return Err("Config field mqtt.server_port must be greater than 0".to_owned());
+    }
+    if !config.mqtt.tls
+        && !config.mqtt.allow_insecure
+        && (!config.mqtt.login.trim().is_empty() || !config.mqtt.password.trim().is_empty())
+    {
+        return Err(
+            "MQTT credentials require TLS. Set mqtt.tls: true or explicitly set mqtt.allow_insecure: true to use plaintext MQTT.".to_owned(),
+        );
     }
     if matches!(config.mqtt.remove_stale_sensors, Some(0)) {
         return Err(
@@ -153,4 +169,77 @@ fn validate_mailboxes(mailboxes: &[ImapMailboxConfig]) -> Result<(), String> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn write_config(content: &str) -> PathBuf {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock should be after unix epoch")
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "dmarc2mqtt-config-test-{}-{unique}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&dir).expect("test config directory should be created");
+        let path = dir.join("config.yaml");
+        fs::write(&path, content).expect("test config should be written");
+        path
+    }
+
+    fn config_yaml(mqtt_extra: &str) -> String {
+        format!(
+            r#"mqtt:
+  server_name: "mqtt.example.local"
+  server_port: 8883
+  login: "dmarc2mqtt"
+  password: "change-me"
+  base_topic: "mail/dmarc"
+{mqtt_extra}imap:
+  mailboxes:
+    - name: "primary"
+      server_name: "imap.example.com"
+      server_port: 993
+      login: "user@example.com"
+      password: "change-me"
+      report_folder: "INBOX/DMARC"
+      trash_folder: "INBOX/Trash"
+      move_emails: false
+"#
+        )
+    }
+
+    #[test]
+    fn defaults_mqtt_to_tls() {
+        let path = write_config(&config_yaml(""));
+        let config = load_config(path.to_str().expect("test path should be valid unicode"))
+            .expect("config should load");
+
+        assert!(config.mqtt.tls);
+        assert!(!config.mqtt.allow_insecure);
+    }
+
+    #[test]
+    fn rejects_plaintext_mqtt_with_credentials_without_opt_in() {
+        let path = write_config(&config_yaml("  tls: false\n"));
+        let err = load_config(path.to_str().expect("test path should be valid unicode"))
+            .expect_err("plaintext MQTT credentials should be rejected");
+
+        assert!(err.contains("MQTT credentials require TLS"));
+    }
+
+    #[test]
+    fn allows_plaintext_mqtt_with_explicit_opt_in() {
+        let path = write_config(&config_yaml("  tls: false\n  allow_insecure: true\n"));
+        let config = load_config(path.to_str().expect("test path should be valid unicode"))
+            .expect("explicit insecure MQTT opt-in should load");
+
+        assert!(!config.mqtt.tls);
+        assert!(config.mqtt.allow_insecure);
+    }
 }

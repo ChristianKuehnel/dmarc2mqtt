@@ -1,9 +1,11 @@
 mqtt:
   server_name: "mqtt.example.local"
-  server_port: 1883
+  server_port: 8883
   login: "dmarc2mqtt"
   password: "change-me"
   base_topic: "mail/dmarc"
+  tls: true
+  allow_insecure: false
   remove_stale_sensors: 30
 imap:
   mailboxes:

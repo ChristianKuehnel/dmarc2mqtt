@@ -20,10 +20,12 @@ Create or edit `config.yaml`:
 ```yaml
 mqtt:
   server_name: "mqtt.example.local"
-  server_port: 1883
+  server_port: 8883
   login: "dmarc2mqtt"
   password: "change-me"
   base_topic: "mail/dmarc"
+  tls: true
+  allow_insecure: false
   remove_stale_sensors: 30
 imap:
   mailboxes:
@@ -55,6 +57,8 @@ Home Assistant discovery is announced for all tuples from `history.json` on ever
 If `mqtt.remove_stale_sensors` is set, tuples not seen for more than that many days are removed from history.
 Each mailbox has its own connection settings, folders, schedule and `max_xml_size`.
 `imap.mailboxes[].max_xml_size` defines the maximum allowed uncompressed XML payload size in MB (applies to XML, GZIP and ZIP attachments).
+MQTT uses TLS by default (`mqtt.tls: true`) and the examples use port `8883`.
+If you must connect to a plaintext broker, set `mqtt.tls: false` and explicitly opt in with `mqtt.allow_insecure: true`.
 
 
 ## Container Image
