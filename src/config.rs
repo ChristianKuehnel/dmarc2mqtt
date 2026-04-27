@@ -148,6 +148,12 @@ fn validate_mailboxes(mailboxes: &[ImapMailboxConfig]) -> Result<(), String> {
                 mailbox_name
             ));
         }
+        if mailbox.server_port == 143 {
+            return Err(format!(
+                "Config field imap.mailboxes['{}'].server_port uses plaintext IMAP port 143. Configure IMAPS/TLS, typically port 993.",
+                mailbox_name
+            ));
+        }
         if mailbox.poll_cron.trim().is_empty() {
             return Err(format!(
                 "Config field imap.mailboxes['{}'].poll_cron must not be empty",
@@ -241,5 +247,18 @@ mod tests {
 
         assert!(!config.mqtt.tls);
         assert!(config.mqtt.allow_insecure);
+    }
+
+    #[test]
+    fn rejects_plaintext_imap_port() {
+        let path = write_config(&config_yaml("").replacen(
+            "      server_port: 993",
+            "      server_port: 143",
+            1,
+        ));
+        let err = load_config(path.to_str().expect("test path should be valid unicode"))
+            .expect_err("plaintext IMAP port should be rejected");
+
+        assert!(err.contains("plaintext IMAP port 143"));
     }
 }

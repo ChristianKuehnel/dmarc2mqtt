@@ -98,6 +98,7 @@ fn connect_and_login(
     mailbox: &ImapMailboxConfig,
 ) -> Result<imap::Session<imap::Connection>, String> {
     let client = imap::ClientBuilder::new(&mailbox.server_name, mailbox.server_port)
+        .tls_kind(imap::TlsKind::Rust)
         .connect()
         .map_err(|err| {
             format!(
