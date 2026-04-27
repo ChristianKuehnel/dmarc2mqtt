@@ -27,6 +27,7 @@ mqtt:
   tls: true
   allow_insecure: false
   remove_stale_sensors: 30
+  max_history_entries: 1000
 imap:
   mailboxes:
     - name: "primary"
@@ -44,6 +45,8 @@ imap:
       max_zip_entries: 1000
       max_zip_xml_files: 10
       max_zip_uncompressed_size: 10
+      max_report_org_name_length: 128
+      max_report_domain_length: 253
     - name: "secondary"
       server_name: "imap.other.example"
       server_port: 993
@@ -59,16 +62,20 @@ imap:
       max_zip_entries: 1000
       max_zip_xml_files: 10
       max_zip_uncompressed_size: 20
+      max_report_org_name_length: 128
+      max_report_domain_length: 253
 ```
 
 After each mailbox poll, the app updates `history.json` in the same directory as the config file.
 It stores the latest `last_seen_epoch` (Unix epoch seconds) for every `org_name + domain` tuple.
 Home Assistant discovery is announced for all tuples from `history.json` on every poll, so sensors stay available even when no new reports arrive.
 If `mqtt.remove_stale_sensors` is set, tuples not seen for more than that many days are removed from history.
+`mqtt.max_history_entries` caps the number of retained `org_name + domain` tuples stored in `history.json`; new unseen tuples are skipped once the cap is full.
 Each mailbox has its own connection settings, folders, schedule and `max_xml_size`.
 `imap.mailboxes[].max_xml_size` defines the maximum allowed uncompressed XML payload size in MB (applies to XML, GZIP and ZIP attachments).
 `imap.mailboxes[].max_message_size` caps IMAP messages before fetching their full RFC822 body, and `max_attachment_size` caps encoded and decoded attachment payloads before parsing.
 ZIP attachments are additionally bounded by `max_zip_entries`, `max_zip_xml_files`, and `max_zip_uncompressed_size` to limit archive-wide work.
+`max_report_org_name_length` and `max_report_domain_length` cap attacker-controlled report metadata before it can create history entries or retained MQTT discovery topics.
 IMAP connections always use TLS; configure an IMAPS endpoint, typically port `993`.
 MQTT uses TLS by default (`mqtt.tls: true`) and the examples use port `8883`.
 If you must connect to a plaintext broker, set `mqtt.tls: false` and explicitly opt in with `mqtt.allow_insecure: true`.

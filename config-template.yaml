@@ -7,6 +7,7 @@ mqtt:
   tls: true
   allow_insecure: false
   remove_stale_sensors: 30
+  max_history_entries: 1000
 imap:
   mailboxes:
     - name: "primary"
@@ -24,3 +25,5 @@ imap:
       max_zip_entries: 1000
       max_zip_xml_files: 10
       max_zip_uncompressed_size: 10
+      max_report_org_name_length: 128
+      max_report_domain_length: 253

@@ -423,6 +423,8 @@ mod tests {
             max_zip_entries: 1000,
             max_zip_xml_files: 10,
             max_zip_uncompressed_size: None,
+            max_report_org_name_length: 128,
+            max_report_domain_length: 253,
         }
     }
 

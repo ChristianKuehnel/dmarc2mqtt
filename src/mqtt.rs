@@ -197,6 +197,7 @@ mod tests {
             tls,
             allow_insecure: !tls,
             remove_stale_sensors: None,
+            max_history_entries: 1000,
         }
     }
 

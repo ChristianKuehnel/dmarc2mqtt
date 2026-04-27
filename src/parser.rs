@@ -313,10 +313,50 @@ fn scan_xml_bytes(input: &[u8], source: &str) -> Result<ScanSummary, String> {
         source: source.to_owned(),
         org_name,
         email,
-        policy_published_domain,
+        policy_published_domain: match policy_published_domain {
+            Some(domain) => Some(normalize_report_domain(&domain, source)?),
+            None => None,
+        },
         result_pass_count,
         result_fail_count,
     })
+}
+
+fn normalize_report_domain(domain: &str, source: &str) -> Result<String, String> {
+    let normalized = domain.trim().trim_end_matches('.').to_ascii_lowercase();
+    validate_report_domain(&normalized)
+        .map_err(|err| format!("Invalid policy_published/domain in {source}: {err}"))?;
+    Ok(normalized)
+}
+
+fn validate_report_domain(domain: &str) -> Result<(), &'static str> {
+    if domain.is_empty() {
+        return Err("domain must not be empty");
+    }
+    if domain.len() > 253 {
+        return Err("domain is longer than 253 characters");
+    }
+    if !domain.contains('.') {
+        return Err("domain must contain at least one dot");
+    }
+    for label in domain.split('.') {
+        if label.is_empty() {
+            return Err("domain contains an empty label");
+        }
+        if label.len() > 63 {
+            return Err("domain label is longer than 63 characters");
+        }
+        if label.starts_with('-') || label.ends_with('-') {
+            return Err("domain labels must not start or end with hyphen");
+        }
+        if !label
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+        {
+            return Err("domain contains characters outside ASCII letters, digits, and hyphen");
+        }
+    }
+    Ok(())
 }
 
 #[derive(Debug)]
@@ -981,6 +1021,21 @@ mod tests {
     }
 
     #[test]
+    fn rejects_invalid_policy_published_domain() {
+        let input = ReportInput {
+            source: "fixture:invalid-domain.xml".to_owned(),
+            file_name: "invalid-domain.xml".to_owned(),
+            message_sender: "noreply@example.com".to_owned(),
+            bytes: dmarc_xml_with_domain("noreply@example.com", "bad_domain").into_bytes(),
+        };
+
+        let err = scan_report_inputs(&[input], 1, default_zip_limits())
+            .expect_err("invalid report domain should fail");
+
+        assert!(err.contains("Invalid policy_published/domain"));
+    }
+
+    #[test]
     fn rejects_zip_with_too_many_entries() {
         let input = zip_input(&[("one.txt", b"ignored".as_slice()), ("two.txt", b"ignored")]);
 
@@ -1062,6 +1117,10 @@ mod tests {
     }
 
     fn dmarc_xml(email: &str) -> String {
+        dmarc_xml_with_domain(email, "example.com")
+    }
+
+    fn dmarc_xml_with_domain(email: &str, domain: &str) -> String {
         format!(
             r#"<?xml version="1.0" encoding="UTF-8"?>
 <feedback>
@@ -1075,7 +1134,7 @@ mod tests {
     </date_range>
   </report_metadata>
   <policy_published>
-    <domain>example.com</domain>
+    <domain>{domain}</domain>
     <p>none</p>
     <pct>100</pct>
   </policy_published>

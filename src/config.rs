@@ -21,6 +21,8 @@ pub(crate) struct MqttConfig {
     pub(crate) allow_insecure: bool,
     #[serde(default)]
     pub(crate) remove_stale_sensors: Option<u64>,
+    #[serde(default = "default_max_history_entries")]
+    pub(crate) max_history_entries: usize,
 }
 
 #[derive(Debug, Deserialize)]
@@ -52,6 +54,10 @@ pub(crate) struct ImapMailboxConfig {
     pub(crate) max_zip_xml_files: usize,
     #[serde(default)]
     pub(crate) max_zip_uncompressed_size: Option<u64>,
+    #[serde(default = "default_max_report_org_name_length")]
+    pub(crate) max_report_org_name_length: usize,
+    #[serde(default = "default_max_report_domain_length")]
+    pub(crate) max_report_domain_length: usize,
 }
 
 fn default_poll_cron() -> String {
@@ -78,8 +84,20 @@ fn default_max_zip_xml_files() -> usize {
     10
 }
 
+fn default_max_report_org_name_length() -> usize {
+    128
+}
+
+fn default_max_report_domain_length() -> usize {
+    253
+}
+
 fn default_mqtt_tls() -> bool {
     true
+}
+
+fn default_max_history_entries() -> usize {
+    1000
 }
 
 pub(crate) fn load_config(path: &str) -> Result<AppConfig, String> {
@@ -115,6 +133,9 @@ pub(crate) fn load_config(path: &str) -> Result<AppConfig, String> {
         return Err(
             "Config field mqtt.remove_stale_sensors must be greater than 0 when set".to_owned(),
         );
+    }
+    if config.mqtt.max_history_entries == 0 {
+        return Err("Config field mqtt.max_history_entries must be greater than 0".to_owned());
     }
     validate_mailboxes(&config.imap.mailboxes)?;
 
@@ -222,6 +243,18 @@ fn validate_mailboxes(mailboxes: &[ImapMailboxConfig]) -> Result<(), String> {
                 mailbox_name
             ));
         }
+        if mailbox.max_report_org_name_length == 0 {
+            return Err(format!(
+                "Config field imap.mailboxes['{}'].max_report_org_name_length must be greater than 0",
+                mailbox_name
+            ));
+        }
+        if mailbox.max_report_domain_length == 0 || mailbox.max_report_domain_length > 253 {
+            return Err(format!(
+                "Config field imap.mailboxes['{}'].max_report_domain_length must be between 1 and 253",
+                mailbox_name
+            ));
+        }
         cron::Schedule::from_str(&mailbox.poll_cron).map_err(|err| {
             format!(
                 "Config field imap.mailboxes['{}'].poll_cron is invalid ({}): {err}",
@@ -284,11 +317,14 @@ mod tests {
 
         assert!(config.mqtt.tls);
         assert!(!config.mqtt.allow_insecure);
+        assert_eq!(config.mqtt.max_history_entries, 1000);
         assert_eq!(config.imap.mailboxes[0].max_message_size, 25);
         assert_eq!(config.imap.mailboxes[0].max_attachment_size, 10);
         assert_eq!(config.imap.mailboxes[0].max_zip_entries, 1000);
         assert_eq!(config.imap.mailboxes[0].max_zip_xml_files, 10);
         assert_eq!(config.imap.mailboxes[0].max_zip_uncompressed_size, None);
+        assert_eq!(config.imap.mailboxes[0].max_report_org_name_length, 128);
+        assert_eq!(config.imap.mailboxes[0].max_report_domain_length, 253);
     }
 
     #[test]
@@ -364,4 +400,32 @@ mod tests {
 
         assert!(err.contains("max_zip_uncompressed_size"));
     }
+
+    #[test]
+    fn rejects_zero_history_and_report_metadata_limits() {
+        let path = write_config(&config_yaml("  max_history_entries: 0\n"));
+        let err = load_config(path.to_str().expect("test path should be valid unicode"))
+            .expect_err("zero max_history_entries should be rejected");
+
+        assert!(err.contains("max_history_entries"));
+
+        let path = write_config(&format!(
+            "{}      max_report_org_name_length: 0\n",
+            config_yaml("")
+        ));
+        let err = load_config(path.to_str().expect("test path should be valid unicode"))
+            .expect_err("zero max_report_org_name_length should be rejected");
+
+        assert!(err.contains("max_report_org_name_length"));
+
+        let path = write_config(&format!(
+            "{}      max_report_domain_length: 0\n",
+            config_yaml("")
+        ));
+        let err = load_config(path.to_str().expect("test path should be valid unicode"))
+            .expect_err("zero max_report_domain_length should be rejected");
+
+        assert!(err.contains("max_report_domain_length"));
+    }
+
 }

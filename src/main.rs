@@ -4,7 +4,7 @@ mod imap_client;
 mod mqtt;
 mod parser;
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::env;
 use std::path::Path;
 use std::process::ExitCode;
@@ -16,7 +16,7 @@ use chrono::{DateTime, Local, Utc};
 use cron::Schedule;
 use config::{AppConfig, ImapMailboxConfig};
 use env_logger::Env;
-use log::{error, info};
+use log::{error, info, warn};
 use parser::{ScanSummary, ZipLimits};
 
 fn main() -> ExitCode {
@@ -140,7 +140,7 @@ fn process_mailboxes_inner(
                 continue;
             }
 
-            summaries.extend(parsed);
+            summaries.extend(filter_report_summaries(mailbox, parsed));
             if mailbox.move_emails {
                 message_uids_to_move.push((mailbox.name.clone(), message.uid));
             }
@@ -149,7 +149,6 @@ fn process_mailboxes_inner(
         mailbox_last_run.insert(mailbox.name.clone(), Utc::now());
     }
 
-    let history_update = history::update_history(history_path, &summaries)?;
     if let Some(max_age_days) = config.mqtt.remove_stale_sensors {
         let prune_result = history::prune_stale_tuples(history_path, max_age_days)?;
         info!(
@@ -157,6 +156,10 @@ fn process_mailboxes_inner(
             max_age_days, prune_result.removed_tuples, prune_result.remaining_tuples
         );
     }
+    let history_update =
+        history::update_history(history_path, &summaries, config.mqtt.max_history_entries)?;
+    let summaries =
+        filter_summaries_by_accepted_history(summaries, &history_update.accepted_tuples);
     let known_tuples = history::load_known_tuples(history_path)?;
     let newest_seen_epoch = known_tuples.iter().map(|item| item.last_seen_epoch).max();
     info!(
@@ -165,6 +168,18 @@ fn process_mailboxes_inner(
         history_update.updated_tuples,
         history_update.total_tuples
     );
+    if history_update.skipped_new_tuples > 0 {
+        warn!(
+            "Skipped {} new tuple(s) because mqtt.max_history_entries ({}) is full.",
+            history_update.skipped_new_tuples, config.mqtt.max_history_entries
+        );
+    }
+    if history_update.removed_over_limit_tuples > 0 {
+        warn!(
+            "Removed {} old history tuple(s) to enforce mqtt.max_history_entries ({}).",
+            history_update.removed_over_limit_tuples, config.mqtt.max_history_entries
+        );
+    }
     info!(
         "Publishing Home Assistant discovery for {} tuple(s) from history (newest last_seen_epoch: {}).",
         known_tuples.len(),
@@ -284,6 +299,80 @@ fn mailbox_names(mailboxes: &[ImapMailboxConfig]) -> String {
         .map(|mailbox| mailbox.name.as_str())
         .collect::<Vec<_>>()
         .join(", ")
+}
+
+fn filter_report_summaries(
+    mailbox: &ImapMailboxConfig,
+    summaries: Vec<ScanSummary>,
+) -> Vec<ScanSummary> {
+    summaries
+        .into_iter()
+        .filter(|summary| report_summary_allowed(mailbox, summary))
+        .collect()
+}
+
+fn report_summary_allowed(mailbox: &ImapMailboxConfig, summary: &ScanSummary) -> bool {
+    let Some(org_name) = summary.org_name.as_deref().map(str::trim) else {
+        warn!(
+            "Skipping DMARC report {}: missing report_metadata/org_name.",
+            summary.source
+        );
+        return false;
+    };
+    let Some(domain) = summary.policy_published_domain.as_deref().map(str::trim) else {
+        warn!(
+            "Skipping DMARC report {}: missing policy_published/domain.",
+            summary.source
+        );
+        return false;
+    };
+    if org_name.is_empty() || domain.is_empty() {
+        warn!(
+            "Skipping DMARC report {}: empty org_name or domain.",
+            summary.source
+        );
+        return false;
+    }
+    if org_name.chars().count() > mailbox.max_report_org_name_length {
+        warn!(
+            "Skipping DMARC report {}: org_name exceeds max_report_org_name_length ({}).",
+            summary.source, mailbox.max_report_org_name_length
+        );
+        return false;
+    }
+    if domain.len() > mailbox.max_report_domain_length {
+        warn!(
+            "Skipping DMARC report {}: domain exceeds max_report_domain_length ({}).",
+            summary.source, mailbox.max_report_domain_length
+        );
+        return false;
+    }
+    true
+}
+
+fn filter_summaries_by_accepted_history(
+    summaries: Vec<ScanSummary>,
+    accepted_tuples: &BTreeSet<(String, String)>,
+) -> Vec<ScanSummary> {
+    summaries
+        .into_iter()
+        .filter(|summary| {
+            let Some(key) = summary_tuple_key(summary) else {
+                return false;
+            };
+            accepted_tuples.contains(&key)
+        })
+        .collect()
+}
+
+fn summary_tuple_key(summary: &ScanSummary) -> Option<(String, String)> {
+    let org_name = summary.org_name.as_deref()?.trim();
+    let domain = summary.policy_published_domain.as_deref()?.trim();
+    if org_name.is_empty() || domain.is_empty() {
+        None
+    } else {
+        Some((org_name.to_owned(), domain.to_owned()))
+    }
 }
 
 fn until(next_run: DateTime<Utc>) -> Duration {
@@ -433,5 +522,58 @@ fn print_domain_status(statuses: &[DomainStatus]) {
     info!("Domain totals:");
     for item in statuses {
         info!("  {}: {}", item.domain, item.status);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn mailbox() -> ImapMailboxConfig {
+        ImapMailboxConfig {
+            name: "primary".to_owned(),
+            server_name: "imap.example.com".to_owned(),
+            server_port: 993,
+            login: "user@example.com".to_owned(),
+            password: "change-me".to_owned(),
+            report_folder: "INBOX/DMARC".to_owned(),
+            trash_folder: "Trash".to_owned(),
+            move_emails: false,
+            poll_cron: "0 0 */6 * * *".to_owned(),
+            max_xml_size: 10,
+            max_message_size: 25,
+            max_attachment_size: 10,
+            max_zip_entries: 1000,
+            max_zip_xml_files: 10,
+            max_zip_uncompressed_size: None,
+            max_report_org_name_length: 16,
+            max_report_domain_length: 253,
+        }
+    }
+
+    fn summary(org_name: &str, domain: &str) -> ScanSummary {
+        ScanSummary {
+            source: format!("fixture:{org_name}-{domain}.xml"),
+            org_name: Some(org_name.to_owned()),
+            email: Some("noreply@example.com".to_owned()),
+            policy_published_domain: Some(domain.to_owned()),
+            result_pass_count: 1,
+            result_fail_count: 0,
+        }
+    }
+
+    #[test]
+    fn filters_reports_outside_metadata_limits() {
+        let mailbox = mailbox();
+        let allowed = summary("Reporter", "example.com");
+        let long_org = summary("Reporter With A Very Long Name", "example.com");
+
+        let filtered = filter_report_summaries(&mailbox, vec![allowed, long_org]);
+
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(
+            filtered[0].policy_published_domain.as_deref(),
+            Some("example.com")
+        );
     }
 }

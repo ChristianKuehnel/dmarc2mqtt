@@ -7,10 +7,13 @@ use serde::{Deserialize, Serialize};
 
 use crate::parser::ScanSummary;
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub(crate) struct HistoryUpdateResult {
     pub(crate) updated_tuples: usize,
     pub(crate) total_tuples: usize,
+    pub(crate) skipped_new_tuples: usize,
+    pub(crate) removed_over_limit_tuples: usize,
+    pub(crate) accepted_tuples: BTreeSet<(String, String)>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -47,10 +50,13 @@ pub(crate) fn history_path_for_config(config_path: &str) -> PathBuf {
 pub(crate) fn update_history(
     history_path: &Path,
     summaries: &[ScanSummary],
+    max_entries: usize,
 ) -> Result<HistoryUpdateResult, String> {
     let mut history_map = load_history(history_path)?;
+    let removed_over_limit_tuples = trim_history_to_max_entries(&mut history_map, max_entries);
     let now_epoch = Utc::now().timestamp();
     let mut updated_keys: BTreeSet<(String, String)> = BTreeSet::new();
+    let mut skipped_new_keys: BTreeSet<(String, String)> = BTreeSet::new();
 
     for summary in summaries {
         let Some(org_name) = summary.org_name.as_deref() else {
@@ -67,6 +73,10 @@ pub(crate) fn update_history(
         }
 
         let key = (org_name.to_owned(), domain.to_owned());
+        if !history_map.contains_key(&key) && history_map.len() >= max_entries {
+            skipped_new_keys.insert(key);
+            continue;
+        }
         history_map.insert(key.clone(), now_epoch);
         updated_keys.insert(key);
     }
@@ -76,6 +86,9 @@ pub(crate) fn update_history(
     Ok(HistoryUpdateResult {
         updated_tuples: updated_keys.len(),
         total_tuples: history_map.len(),
+        skipped_new_tuples: skipped_new_keys.len(),
+        removed_over_limit_tuples,
+        accepted_tuples: updated_keys,
     })
 }
 
@@ -175,4 +188,110 @@ fn save_history(path: &Path, history: &BTreeMap<(String, String), i64>) -> Resul
     })?;
 
     Ok(())
+}
+
+fn trim_history_to_max_entries(
+    history: &mut BTreeMap<(String, String), i64>,
+    max_entries: usize,
+) -> usize {
+    let mut removed = 0usize;
+    while history.len() > max_entries {
+        let Some(key) = history
+            .iter()
+            .min_by_key(|(_, last_seen_epoch)| *last_seen_epoch)
+            .map(|(key, _)| key.clone())
+        else {
+            break;
+        };
+        history.remove(&key);
+        removed += 1;
+    }
+    removed
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn temp_history_path() -> PathBuf {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock should be after unix epoch")
+            .as_nanos();
+        std::env::temp_dir().join(format!(
+            "dmarc2mqtt-history-test-{}-{unique}.json",
+            std::process::id()
+        ))
+    }
+
+    fn summary(org_name: &str, domain: &str) -> ScanSummary {
+        ScanSummary {
+            source: format!("fixture:{org_name}-{domain}.xml"),
+            org_name: Some(org_name.to_owned()),
+            email: Some("noreply@example.com".to_owned()),
+            policy_published_domain: Some(domain.to_owned()),
+            result_pass_count: 1,
+            result_fail_count: 0,
+        }
+    }
+
+    #[test]
+    fn caps_new_history_entries_without_evicting_existing_entries() {
+        let path = temp_history_path();
+
+        let first = update_history(&path, &[summary("Reporter A", "example.com")], 1)
+            .expect("first history update should fit");
+        assert_eq!(first.updated_tuples, 1);
+        assert_eq!(first.total_tuples, 1);
+        assert_eq!(first.skipped_new_tuples, 0);
+        assert_eq!(first.removed_over_limit_tuples, 0);
+
+        let second = update_history(
+            &path,
+            &[
+                summary("Reporter A", "example.com"),
+                summary("Reporter B", "example.net"),
+            ],
+            1,
+        )
+        .expect("history update should skip new overflow tuple");
+
+        assert_eq!(second.updated_tuples, 1);
+        assert_eq!(second.total_tuples, 1);
+        assert_eq!(second.skipped_new_tuples, 1);
+        assert_eq!(second.removed_over_limit_tuples, 0);
+        assert!(second
+            .accepted_tuples
+            .contains(&("Reporter A".to_owned(), "example.com".to_owned())));
+
+        let known = load_known_tuples(&path).expect("history should load");
+        assert_eq!(known.len(), 1);
+        assert_eq!(known[0].org_name, "Reporter A");
+        assert_eq!(known[0].domain, "example.com");
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn trims_existing_history_back_to_the_entry_limit() {
+        let path = temp_history_path();
+        let mut existing = BTreeMap::new();
+        existing.insert(("Old Reporter".to_owned(), "old.example.com".to_owned()), 1);
+        existing.insert(("New Reporter".to_owned(), "new.example.com".to_owned()), 2);
+        save_history(&path, &existing).expect("history fixture should save");
+
+        let result = update_history(&path, &[], 1).expect("history trim should succeed");
+
+        assert_eq!(result.updated_tuples, 0);
+        assert_eq!(result.total_tuples, 1);
+        assert_eq!(result.removed_over_limit_tuples, 1);
+
+        let known = load_known_tuples(&path).expect("history should load");
+        assert_eq!(known.len(), 1);
+        assert_eq!(known[0].org_name, "New Reporter");
+        assert_eq!(known[0].domain, "new.example.com");
+
+        let _ = fs::remove_file(path);
+    }
 }
