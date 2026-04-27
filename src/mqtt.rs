@@ -26,16 +26,7 @@ pub(crate) fn publish_reports_to_mqtt(
     domain_statuses: &[DomainStatus],
     known_tuples: &[KnownTuple],
 ) -> Result<(), String> {
-    let mut mqtt_options = rumqttc::MqttOptions::new(
-        "dmarc2mqtt",
-        config.mqtt.server_name.clone(),
-        config.mqtt.server_port,
-    );
-    if config.mqtt.tls {
-        mqtt_options.set_transport(rumqttc::Transport::tls_with_default_config());
-    }
-    mqtt_options.set_credentials(config.mqtt.login.clone(), config.mqtt.password.clone());
-    mqtt_options.set_keep_alive(Duration::from_secs(10));
+    let mqtt_options = mqtt_options_from_config(config);
 
     let (client, mut connection) = rumqttc::Client::new(mqtt_options, 20);
     let running = Arc::new(AtomicBool::new(true));
@@ -157,6 +148,20 @@ pub(crate) fn publish_reports_to_mqtt(
     Ok(())
 }
 
+fn mqtt_options_from_config(config: &AppConfig) -> rumqttc::MqttOptions {
+    let mut mqtt_options = rumqttc::MqttOptions::new(
+        "dmarc2mqtt",
+        config.mqtt.server_name.clone(),
+        config.mqtt.server_port,
+    );
+    if config.mqtt.tls {
+        mqtt_options.set_transport(rumqttc::Transport::tls_with_default_config());
+    }
+    mqtt_options.set_credentials(config.mqtt.login.clone(), config.mqtt.password.clone());
+    mqtt_options.set_keep_alive(Duration::from_secs(10));
+    mqtt_options
+}
+
 fn slugify(input: &str) -> String {
     let mut output = String::with_capacity(input.len());
     let mut prev_underscore = false;
@@ -175,5 +180,60 @@ fn slugify(input: &str) -> String {
         "unknown".to_owned()
     } else {
         trimmed
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::{ImapConfig, ImapMailboxConfig, MqttConfig};
+
+    fn config(mqtt: MqttConfig) -> AppConfig {
+        AppConfig {
+            mqtt,
+            imap: ImapConfig {
+                mailboxes: vec![ImapMailboxConfig {
+                    name: "primary".to_owned(),
+                    server_name: "imap.example.com".to_owned(),
+                    server_port: 993,
+                    login: "user@example.com".to_owned(),
+                    password: "change-me".to_owned(),
+                    report_folder: "INBOX/DMARC".to_owned(),
+                    trash_folder: "Trash".to_owned(),
+                    move_emails: false,
+                    poll_cron: "0 0 */6 * * *".to_owned(),
+                    max_xml_size: 10,
+                    max_message_size: 25,
+                    max_attachment_size: 10,
+                }],
+            },
+        }
+    }
+
+    fn mqtt_config(tls: bool) -> MqttConfig {
+        MqttConfig {
+            server_name: "mqtt.example.local".to_owned(),
+            server_port: if tls { 8883 } else { 1883 },
+            login: "dmarc2mqtt".to_owned(),
+            password: "change-me".to_owned(),
+            base_topic: "mail/dmarc".to_owned(),
+            tls,
+            allow_insecure: !tls,
+            remove_stale_sensors: None,
+        }
+    }
+
+    #[test]
+    fn tls_config_selects_tls_transport() {
+        let options = mqtt_options_from_config(&config(mqtt_config(true)));
+
+        assert!(matches!(options.transport(), rumqttc::Transport::Tls(_)));
+    }
+
+    #[test]
+    fn explicit_insecure_config_selects_tcp_transport() {
+        let options = mqtt_options_from_config(&config(mqtt_config(false)));
+
+        assert!(matches!(options.transport(), rumqttc::Transport::Tcp));
     }
 }
