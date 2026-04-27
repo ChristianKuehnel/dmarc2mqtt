@@ -245,6 +245,8 @@ fn scan_zip_bytes(
 }
 
 fn scan_xml_bytes(input: &[u8], source: &str) -> Result<ScanSummary, String> {
+    validate_dmarc_xml_schema(input, source)?;
+
     let mut reader = Reader::from_reader(input);
     reader.config_mut().trim_text(true);
 
@@ -315,6 +317,506 @@ fn scan_xml_bytes(input: &[u8], source: &str) -> Result<ScanSummary, String> {
         result_pass_count,
         result_fail_count,
     })
+}
+
+#[derive(Debug)]
+struct DmarcElement {
+    name: String,
+    text: String,
+    children: Vec<DmarcElement>,
+}
+
+#[derive(Clone, Copy)]
+struct ChildSpec {
+    name: &'static str,
+    min: usize,
+    max: Option<usize>,
+}
+
+impl ChildSpec {
+    const fn required(name: &'static str) -> Self {
+        Self {
+            name,
+            min: 1,
+            max: Some(1),
+        }
+    }
+
+    const fn optional(name: &'static str) -> Self {
+        Self {
+            name,
+            min: 0,
+            max: Some(1),
+        }
+    }
+
+    const fn unbounded(name: &'static str, min: usize) -> Self {
+        Self {
+            name,
+            min,
+            max: None,
+        }
+    }
+}
+
+fn validate_dmarc_xml_schema(input: &[u8], source: &str) -> Result<(), String> {
+    let root = parse_xml_tree(input, source)?;
+    validate_feedback(&root)
+        .map_err(|err| format!("XML schema validation failed in {source}: {err}"))
+}
+
+fn parse_xml_tree(input: &[u8], source: &str) -> Result<DmarcElement, String> {
+    let mut reader = Reader::from_reader(input);
+    reader.config_mut().trim_text(true);
+    let mut buf = Vec::new();
+    let mut stack: Vec<DmarcElement> = Vec::new();
+    let mut root: Option<DmarcElement> = None;
+
+    loop {
+        match reader.read_event_into(&mut buf) {
+            Ok(Event::Start(e)) => {
+                stack.push(DmarcElement {
+                    name: local_name(e.name().as_ref()),
+                    text: String::new(),
+                    children: Vec::new(),
+                });
+            }
+            Ok(Event::Empty(e)) => {
+                let element = DmarcElement {
+                    name: local_name(e.name().as_ref()),
+                    text: String::new(),
+                    children: Vec::new(),
+                };
+                attach_xml_element(element, &mut stack, &mut root, source)?;
+            }
+            Ok(Event::Text(e)) => {
+                let text = e
+                    .xml10_content()
+                    .map_err(|err| format!("Failed to decode text in {source}: {err}"))?;
+                if let Some(current) = stack.last_mut() {
+                    current.text.push_str(text.trim());
+                } else if !text.trim().is_empty() {
+                    return Err(format!("Unexpected text outside root element in {source}"));
+                }
+            }
+            Ok(Event::End(e)) => {
+                let end_name = local_name(e.name().as_ref());
+                let element = stack
+                    .pop()
+                    .ok_or_else(|| format!("Unexpected closing tag </{end_name}> in {source}"))?;
+                if element.name != end_name {
+                    return Err(format!(
+                        "Mismatched XML tag in {source}: opened <{}> but closed </{}>",
+                        element.name, end_name
+                    ));
+                }
+                attach_xml_element(element, &mut stack, &mut root, source)?;
+            }
+            Ok(Event::Eof) => break,
+            Ok(_) => {}
+            Err(err) => return Err(format!("XML parse error in {source}: {err}")),
+        }
+        buf.clear();
+    }
+
+    if let Some(open) = stack.last() {
+        return Err(format!("Unclosed XML tag <{}> in {source}", open.name));
+    }
+    root.ok_or_else(|| format!("XML attachment {source} does not contain a root element"))
+}
+
+fn attach_xml_element(
+    element: DmarcElement,
+    stack: &mut [DmarcElement],
+    root: &mut Option<DmarcElement>,
+    source: &str,
+) -> Result<(), String> {
+    if let Some(parent) = stack.last_mut() {
+        parent.children.push(element);
+    } else if root.is_none() {
+        *root = Some(element);
+    } else {
+        return Err(format!(
+            "XML attachment {source} contains multiple root elements"
+        ));
+    }
+    Ok(())
+}
+
+fn validate_feedback(element: &DmarcElement) -> Result<(), String> {
+    if element.name != "feedback" {
+        return Err(format!(
+            "root element must be <feedback>, found <{}>",
+            element.name
+        ));
+    }
+    expect_sequence(
+        element,
+        &[
+            ChildSpec::optional("version"),
+            ChildSpec::required("report_metadata"),
+            ChildSpec::required("policy_published"),
+            ChildSpec::unbounded("record", 1),
+        ],
+    )?;
+    if let Some(version) = child(element, "version") {
+        expect_decimal(version)?;
+    }
+    validate_report_metadata(require_child(element, "report_metadata")?)?;
+    validate_policy_published(require_child(element, "policy_published")?)?;
+    for record in children(element, "record") {
+        validate_record(record)?;
+    }
+    Ok(())
+}
+
+fn validate_report_metadata(element: &DmarcElement) -> Result<(), String> {
+    expect_sequence(
+        element,
+        &[
+            ChildSpec::required("org_name"),
+            ChildSpec::required("email"),
+            ChildSpec::optional("extra_contact_info"),
+            ChildSpec::required("report_id"),
+            ChildSpec::required("date_range"),
+            ChildSpec::unbounded("error", 0),
+        ],
+    )?;
+    expect_text_child(element, "org_name")?;
+    expect_text_child(element, "email")?;
+    expect_text_child(element, "report_id")?;
+    validate_date_range(require_child(element, "date_range")?)?;
+    Ok(())
+}
+
+fn validate_date_range(element: &DmarcElement) -> Result<(), String> {
+    expect_all(
+        element,
+        &[ChildSpec::required("begin"), ChildSpec::required("end")],
+    )?;
+    expect_integer(require_child(element, "begin")?)?;
+    expect_integer(require_child(element, "end")?)?;
+    Ok(())
+}
+
+fn validate_policy_published(element: &DmarcElement) -> Result<(), String> {
+    expect_all(
+        element,
+        &[
+            ChildSpec::required("domain"),
+            ChildSpec::optional("adkim"),
+            ChildSpec::optional("aspf"),
+            ChildSpec::required("p"),
+            ChildSpec::optional("sp"),
+            ChildSpec::optional("pct"),
+            ChildSpec::optional("fo"),
+            ChildSpec::optional("np"),
+            ChildSpec::optional("discovery_method"),
+            ChildSpec::optional("testing"),
+        ],
+    )?;
+    expect_text_child(element, "domain")?;
+    if let Some(adkim) = child(element, "adkim") {
+        expect_enum(adkim, &["r", "s"])?;
+    }
+    if let Some(aspf) = child(element, "aspf") {
+        expect_enum(aspf, &["r", "s"])?;
+    }
+    expect_enum(
+        require_child(element, "p")?,
+        &["none", "quarantine", "reject"],
+    )?;
+    if let Some(sp) = child(element, "sp") {
+        expect_enum(sp, &["none", "quarantine", "reject"])?;
+    }
+    if let Some(pct) = child(element, "pct") {
+        expect_integer(pct)?;
+    }
+    Ok(())
+}
+
+fn validate_record(element: &DmarcElement) -> Result<(), String> {
+    expect_sequence(
+        element,
+        &[
+            ChildSpec::required("row"),
+            ChildSpec::required("identifiers"),
+            ChildSpec::required("auth_results"),
+        ],
+    )?;
+    validate_row(require_child(element, "row")?)?;
+    validate_identifiers(require_child(element, "identifiers")?)?;
+    validate_auth_results(require_child(element, "auth_results")?)?;
+    Ok(())
+}
+
+fn validate_row(element: &DmarcElement) -> Result<(), String> {
+    expect_all(
+        element,
+        &[
+            ChildSpec::required("source_ip"),
+            ChildSpec::required("count"),
+            ChildSpec::required("policy_evaluated"),
+        ],
+    )?;
+    expect_text_child(element, "source_ip")?;
+    expect_integer(require_child(element, "count")?)?;
+    validate_policy_evaluated(require_child(element, "policy_evaluated")?)?;
+    Ok(())
+}
+
+fn validate_policy_evaluated(element: &DmarcElement) -> Result<(), String> {
+    expect_sequence(
+        element,
+        &[
+            ChildSpec::required("disposition"),
+            ChildSpec::required("dkim"),
+            ChildSpec::required("spf"),
+            ChildSpec::unbounded("reason", 0),
+        ],
+    )?;
+    expect_enum(
+        require_child(element, "disposition")?,
+        &["none", "quarantine", "reject"],
+    )?;
+    expect_enum(require_child(element, "dkim")?, &["pass", "fail"])?;
+    expect_enum(require_child(element, "spf")?, &["pass", "fail"])?;
+    for reason in children(element, "reason") {
+        validate_policy_override_reason(reason)?;
+    }
+    Ok(())
+}
+
+fn validate_policy_override_reason(element: &DmarcElement) -> Result<(), String> {
+    expect_all(
+        element,
+        &[ChildSpec::required("type"), ChildSpec::optional("comment")],
+    )?;
+    expect_enum(
+        require_child(element, "type")?,
+        &[
+            "forwarded",
+            "sampled_out",
+            "trusted_forwarder",
+            "mailing_list",
+            "local_policy",
+            "other",
+        ],
+    )
+}
+
+fn validate_identifiers(element: &DmarcElement) -> Result<(), String> {
+    expect_all(
+        element,
+        &[
+            ChildSpec::optional("envelope_to"),
+            ChildSpec::optional("envelope_from"),
+            ChildSpec::required("header_from"),
+        ],
+    )?;
+    expect_text_child(element, "header_from")?;
+    Ok(())
+}
+
+fn validate_auth_results(element: &DmarcElement) -> Result<(), String> {
+    expect_sequence(
+        element,
+        &[
+            ChildSpec::unbounded("dkim", 0),
+            ChildSpec::unbounded("spf", 1),
+        ],
+    )?;
+    for dkim in children(element, "dkim") {
+        validate_dkim_auth_result(dkim)?;
+    }
+    for spf in children(element, "spf") {
+        validate_spf_auth_result(spf)?;
+    }
+    Ok(())
+}
+
+fn validate_dkim_auth_result(element: &DmarcElement) -> Result<(), String> {
+    expect_all(
+        element,
+        &[
+            ChildSpec::required("domain"),
+            ChildSpec::optional("selector"),
+            ChildSpec::required("result"),
+            ChildSpec::optional("human_result"),
+        ],
+    )?;
+    expect_text_child(element, "domain")?;
+    expect_enum(
+        require_child(element, "result")?,
+        &[
+            "none",
+            "pass",
+            "fail",
+            "policy",
+            "neutral",
+            "temperror",
+            "permerror",
+        ],
+    )
+}
+
+fn validate_spf_auth_result(element: &DmarcElement) -> Result<(), String> {
+    expect_all(
+        element,
+        &[
+            ChildSpec::required("domain"),
+            ChildSpec::optional("scope"),
+            ChildSpec::required("result"),
+        ],
+    )?;
+    expect_text_child(element, "domain")?;
+    if let Some(scope) = child(element, "scope") {
+        expect_enum(scope, &["helo", "mfrom"])?;
+    }
+    expect_enum(
+        require_child(element, "result")?,
+        &[
+            "none",
+            "neutral",
+            "pass",
+            "fail",
+            "softfail",
+            "temperror",
+            "permerror",
+        ],
+    )
+}
+
+fn expect_sequence(element: &DmarcElement, specs: &[ChildSpec]) -> Result<(), String> {
+    let mut index = 0usize;
+    for spec in specs {
+        let mut count = 0usize;
+        while index < element.children.len() && element.children[index].name == spec.name {
+            count += 1;
+            index += 1;
+            if spec.max.is_some_and(|max| count > max) {
+                return Err(format!(
+                    "<{}> contains too many <{}> elements",
+                    element.name, spec.name
+                ));
+            }
+        }
+        if count < spec.min {
+            return Err(format!(
+                "<{}> is missing required <{}> element",
+                element.name, spec.name
+            ));
+        }
+    }
+    if let Some(extra) = element.children.get(index) {
+        return Err(format!(
+            "<{}> contains unexpected <{}> element",
+            element.name, extra.name
+        ));
+    }
+    Ok(())
+}
+
+fn expect_all(element: &DmarcElement, specs: &[ChildSpec]) -> Result<(), String> {
+    for child in &element.children {
+        let Some(spec) = specs.iter().find(|spec| spec.name == child.name) else {
+            return Err(format!(
+                "<{}> contains unexpected <{}> element",
+                element.name, child.name
+            ));
+        };
+        let count = element
+            .children
+            .iter()
+            .filter(|candidate| candidate.name == child.name)
+            .count();
+        if spec.max.is_some_and(|max| count > max) {
+            return Err(format!(
+                "<{}> contains too many <{}> elements",
+                element.name, child.name
+            ));
+        }
+    }
+    for spec in specs {
+        let count = element
+            .children
+            .iter()
+            .filter(|candidate| candidate.name == spec.name)
+            .count();
+        if count < spec.min {
+            return Err(format!(
+                "<{}> is missing required <{}> element",
+                element.name, spec.name
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn expect_text_child(element: &DmarcElement, name: &str) -> Result<(), String> {
+    expect_text(require_child(element, name)?)
+}
+
+fn expect_text(element: &DmarcElement) -> Result<(), String> {
+    if !element.children.is_empty() {
+        return Err(format!("<{}> must contain text only", element.name));
+    }
+    if element.text.trim().is_empty() {
+        return Err(format!("<{}> must not be empty", element.name));
+    }
+    Ok(())
+}
+
+fn expect_integer(element: &DmarcElement) -> Result<(), String> {
+    expect_text(element)?;
+    element
+        .text
+        .trim()
+        .parse::<i64>()
+        .map(|_| ())
+        .map_err(|_| format!("<{}> must contain an integer", element.name))
+}
+
+fn expect_decimal(element: &DmarcElement) -> Result<(), String> {
+    expect_text(element)?;
+    element
+        .text
+        .trim()
+        .parse::<f64>()
+        .map(|_| ())
+        .map_err(|_| format!("<{}> must contain a decimal", element.name))
+}
+
+fn expect_enum(element: &DmarcElement, allowed: &[&str]) -> Result<(), String> {
+    expect_text(element)?;
+    let value = element.text.trim();
+    if allowed.contains(&value) {
+        Ok(())
+    } else {
+        Err(format!(
+            "<{}> contains invalid value '{}'",
+            element.name, value
+        ))
+    }
+}
+
+fn require_child<'a>(element: &'a DmarcElement, name: &str) -> Result<&'a DmarcElement, String> {
+    child(element, name)
+        .ok_or_else(|| format!("<{}> is missing required <{}> element", element.name, name))
+}
+
+fn child<'a>(element: &'a DmarcElement, name: &str) -> Option<&'a DmarcElement> {
+    element.children.iter().find(|child| child.name == name)
+}
+
+fn children<'a>(
+    element: &'a DmarcElement,
+    name: &'a str,
+) -> impl Iterator<Item = &'a DmarcElement> {
+    element
+        .children
+        .iter()
+        .filter(move |child| child.name == name)
 }
 
 fn local_name(name: &[u8]) -> String {
@@ -432,6 +934,53 @@ mod tests {
     }
 
     #[test]
+    fn rejects_xml_that_does_not_match_dmarc_schema() {
+        let input = ReportInput {
+            source: "fixture:invalid.xml".to_owned(),
+            file_name: "invalid.xml".to_owned(),
+            message_sender: "noreply@example.com".to_owned(),
+            bytes: br#"<?xml version="1.0" encoding="UTF-8"?>
+<feedback>
+  <report_metadata>
+    <org_name>Example</org_name>
+    <email>noreply@example.com</email>
+  </report_metadata>
+  <policy_published>
+    <domain>example.com</domain>
+    <p>none</p>
+  </policy_published>
+  <record>
+    <row>
+      <source_ip>192.0.2.1</source_ip>
+      <count>1</count>
+      <policy_evaluated>
+        <disposition>none</disposition>
+        <dkim>pass</dkim>
+        <spf>pass</spf>
+      </policy_evaluated>
+    </row>
+    <identifiers>
+      <header_from>example.com</header_from>
+    </identifiers>
+    <auth_results>
+      <spf>
+        <domain>example.com</domain>
+        <result>pass</result>
+      </spf>
+    </auth_results>
+  </record>
+</feedback>"#
+                .to_vec(),
+        };
+
+        let err = scan_report_inputs(&[input], 1, default_zip_limits())
+            .expect_err("schema validation should reject missing report_id/date_range");
+
+        assert!(err.contains("XML schema validation failed"));
+        assert!(err.contains("report_id"));
+    }
+
+    #[test]
     fn rejects_zip_with_too_many_entries() {
         let input = zip_input(&[("one.txt", b"ignored".as_slice()), ("two.txt", b"ignored")]);
 
@@ -519,17 +1068,36 @@ mod tests {
   <report_metadata>
     <org_name>Example</org_name>
     <email>{email}</email>
+    <report_id>synthetic-report</report_id>
+    <date_range>
+      <begin>1774656000</begin>
+      <end>1774742399</end>
+    </date_range>
   </report_metadata>
   <policy_published>
     <domain>example.com</domain>
+    <p>none</p>
+    <pct>100</pct>
   </policy_published>
   <record>
     <row>
+      <source_ip>192.0.2.1</source_ip>
+      <count>1</count>
       <policy_evaluated>
+        <disposition>none</disposition>
         <dkim>pass</dkim>
         <spf>pass</spf>
       </policy_evaluated>
     </row>
+    <identifiers>
+      <header_from>example.com</header_from>
+    </identifiers>
+    <auth_results>
+      <spf>
+        <domain>example.com</domain>
+        <result>pass</result>
+      </spf>
+    </auth_results>
   </record>
 </feedback>"#
         )

@@ -49,6 +49,9 @@
   <xs:all>
     <!-- The domain at which the DMARC record was found. -->
     <xs:element name="domain" type="xs:string"/>
+    <!-- Common report-generator extension: how the organizational domain was found. -->
+    <xs:element name="discovery_method" type="xs:string"
+                minOccurs="0"/>
     <!-- The DKIM alignment mode. -->
     <xs:element name="adkim" type="AlignmentType"
                 minOccurs="0"/>
@@ -61,12 +64,16 @@
     <xs:element name="sp" type="DispositionType"
                 minOccurs="0"/>
     <!-- The percent of messages to which policy applies. -->
-    <xs:element name="pct" type="xs:integer"/>
+    <xs:element name="pct" type="xs:integer"
+                minOccurs="0"/>
     <!-- Failure reporting options in effect. -->
     <xs:element name="fo" type="xs:string"
                 minOccurs="0"/>
     <!-- RFC9091: Requested Mail Receiver policy for non-existent subdomains. -->
     <xs:element name="np" type="xs:string"
+                minOccurs="0"/>
+    <!-- Common report-generator extension: whether the report is test data. -->
+    <xs:element name="testing" type="xs:string"
                 minOccurs="0"/>
   </xs:all>
 </xs:complexType>
